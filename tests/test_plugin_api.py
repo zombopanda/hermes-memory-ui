@@ -218,3 +218,209 @@ def test_honcho_missing_sdk_returns_error(monkeypatch, tmp_path):
     assert payload["api_key_present"] is False
     assert payload["error"]
     assert "Honcho" in payload["error"]
+
+
+
+def install_fake_hindsight_provider(monkeypatch, calls):
+    fake_plugins = types.ModuleType("plugins")
+    fake_memory = types.ModuleType("plugins.memory")
+    fake_hindsight = types.ModuleType("plugins.memory.hindsight")
+
+    class FakeProvider:
+        def initialize(self, **kwargs):
+            calls.append(("initialize", kwargs))
+            self._bank_id = "test-bank"
+            self._budget = "high"
+            self._recall_max_tokens = 1234
+            self._recall_tags = ["dashboard"]
+            self._recall_tags_match = "all"
+            self._recall_types = None
+
+        def _run_hindsight_operation(self, fn):
+            calls.append(("run",))
+            return fn(self)
+
+        def arecall(self, **kwargs):
+            calls.append(("arecall", kwargs))
+            return types.SimpleNamespace(results=[
+                types.SimpleNamespace(id="r1", text="Hindsight memory result", score=0.87, metadata={"source": "test"}),
+                types.SimpleNamespace(id="r2", text="Second result", score=0.42, metadata={}),
+            ])
+
+        def areflect(self, **kwargs):
+            calls.append(("areflect", kwargs))
+            return types.SimpleNamespace(text="Hindsight reflection")
+
+    fake_hindsight.HindsightMemoryProvider = FakeProvider
+    monkeypatch.setitem(sys.modules, "plugins", fake_plugins)
+    monkeypatch.setitem(sys.modules, "plugins.memory", fake_memory)
+    monkeypatch.setitem(sys.modules, "plugins.memory.hindsight", fake_hindsight)
+
+
+def test_hindsight_config_status_hides_keys_and_reads_local_config(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    cfg_path = tmp_path / "hindsight" / "config.json"
+    cfg_path.parent.mkdir()
+    cfg_path.write_text(json.dumps({
+        "mode": "local_embedded",
+        "apiKey": "hindsight-secret",
+        "llm_api_key": "llm-secret",
+        "llm_provider": "ollama",
+        "llm_model": "nemotron-3-super:cloud",
+        "bank_id": "dashboard-bank",
+        "recall_budget": "high",
+        "memory_mode": "hybrid",
+        "auto_retain": False,
+        "auto_recall": False,
+    }), encoding="utf-8")
+
+    module = load_plugin_api(monkeypatch, tmp_path)
+    payload = module._hindsight_payload(mode="status")
+
+    assert payload["provider_configured"] is True
+    assert payload["config_exists"] is True
+    assert payload["mode"] == "local_embedded"
+    assert payload["api_url"] == "http://localhost:8888"
+    assert payload["api_key_present"] is True
+    assert payload["llm_key_present"] is True
+    assert payload["bank_id"] == "dashboard-bank"
+    assert payload["recall_budget"] == "high"
+    assert payload["auto_retain"] is False
+    assert payload["auto_recall"] is False
+    dumped = json.dumps(payload)
+    assert "hindsight-secret" not in dumped
+    assert "llm-secret" not in dumped
+
+
+def test_hindsight_recall_and_reflect_use_provider_without_retain(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    cfg_path = tmp_path / "hindsight" / "config.json"
+    cfg_path.parent.mkdir()
+    cfg_path.write_text(json.dumps({"mode": "cloud", "apiKey": "secret", "bank_id": "test-bank", "recall_budget": "high"}), encoding="utf-8")
+    calls = []
+    install_fake_hindsight_provider(monkeypatch, calls)
+
+    module = load_plugin_api(monkeypatch, tmp_path)
+    recall = module._hindsight_payload(query="dashboard", limit=1, mode="recall")
+    reflect = module._hindsight_payload(query="dashboard", mode="reflect")
+
+    assert recall["result_count"] == 1
+    assert recall["results"][0]["text"] == "Hindsight memory result"
+    assert recall["results"][0]["score"] == 0.87
+    assert reflect["reflection"] == "Hindsight reflection"
+    assert ("arecall", {"bank_id": "test-bank", "query": "dashboard", "budget": "high", "max_tokens": 1234, "tags": ["dashboard"], "tags_match": "all"}) in calls
+    assert ("areflect", {"bank_id": "test-bank", "query": "dashboard", "budget": "high"}) in calls
+    assert "secret" not in json.dumps(recall)
+    assert not any(call and call[0] == "aretain" for call in calls)
+
+
+def test_hindsight_snapshot_and_status_include_config_without_querying(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    cfg_path = tmp_path / "hindsight" / "config.json"
+    cfg_path.parent.mkdir()
+    cfg_path.write_text(json.dumps({"mode": "local_external", "api_key": "secret", "api_url": "http://127.0.0.1:8888", "bank_id": "snap-bank"}), encoding="utf-8")
+
+    module = load_plugin_api(monkeypatch, tmp_path)
+    import asyncio
+
+    snapshot = asyncio.run(module.snapshot(limit=5))
+    status = asyncio.run(module.status())
+
+    assert snapshot["hindsight"]["provider_configured"] is True
+    assert snapshot["hindsight"]["operation"] == "status"
+    assert snapshot["hindsight"]["results"] == []
+    assert status["hindsight"]["provider_configured"] is True
+    assert status["hindsight"]["mode"] == "local_external"
+    assert status["hindsight"]["bank_id"] == "snap-bank"
+    assert "secret" not in json.dumps(snapshot)
+    assert "secret" not in json.dumps(status)
+
+
+
+def test_hindsight_contents_lists_client_memories_and_documents(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    cfg_path = tmp_path / "hindsight" / "config.json"
+    cfg_path.parent.mkdir()
+    cfg_path.write_text(json.dumps({"mode": "local_external", "api_url": "http://127.0.0.1:8888", "bank_id": "demo-bank"}), encoding="utf-8")
+    calls = []
+
+    class FakeApi:
+        def __init__(self, name):
+            self.name = name
+
+        async def get_agent_stats(self, **kwargs):
+            calls.append(("stats", kwargs))
+            return types.SimpleNamespace(total_nodes=1, total_documents=1)
+
+        async def list_memories(self, **kwargs):
+            calls.append(("list_memories", kwargs))
+            return types.SimpleNamespace(items=[types.SimpleNamespace(id="m1", text="Hindsight dashboard memory", type="world")], total=1)
+
+        async def list_documents(self, **kwargs):
+            calls.append(("list_documents", kwargs))
+            return types.SimpleNamespace(items=[types.SimpleNamespace(id="d1", text_length=32, memory_unit_count=0)], total=1)
+
+        async def get_document(self, **kwargs):
+            calls.append(("get_document", kwargs))
+            return types.SimpleNamespace(id="d1", original_text="Dashboard source document", memory_unit_count=0, tags=["demo"])
+
+    class FakeHindsight:
+        def __init__(self, base_url, api_key=None, timeout=300.0, user_agent=None):
+            calls.append(("init", base_url, api_key, timeout, user_agent))
+            self.banks = FakeApi("banks")
+            self.memory = FakeApi("memory")
+            self.documents = FakeApi("documents")
+
+        async def aclose(self):
+            calls.append(("close",))
+
+    fake_client = types.ModuleType("hindsight_client")
+    fake_client.Hindsight = FakeHindsight
+    monkeypatch.setitem(sys.modules, "hindsight_client", fake_client)
+    module = load_plugin_api(monkeypatch, tmp_path)
+
+    payload = module._hindsight_contents_payload(limit=10, search="dashboard")
+
+    assert payload["memory_count"] == 1
+    assert payload["document_count"] == 1
+    assert payload["memories"][0]["text"] == "Hindsight dashboard memory"
+    assert payload["documents"][0]["text"] == "Dashboard source document"
+    assert any(call[0] == "list_memories" for call in calls)
+    assert any(call[0] == "list_documents" for call in calls)
+    assert not any("/v1/default" in str(call) for call in calls)
+
+
+def test_hindsight_recall_does_not_fall_back_to_documents(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    cfg_path = tmp_path / "hindsight" / "config.json"
+    cfg_path.parent.mkdir()
+    cfg_path.write_text(json.dumps({"mode": "cloud", "apiKey": "secret", "bank_id": "test-bank", "recall_budget": "high"}), encoding="utf-8")
+    install_fake_hindsight_provider(monkeypatch, [])
+    module = load_plugin_api(monkeypatch, tmp_path)
+
+    class EmptyRecallProvider:
+        _bank_id = "test-bank"
+        _budget = "high"
+        _recall_max_tokens = 1234
+        _recall_tags = None
+        _recall_tags_match = "any"
+        _recall_types = None
+
+        def _run_hindsight_operation(self, fn):
+            return fn(self)
+
+        def arecall(self, **kwargs):
+            return types.SimpleNamespace(results=[])
+
+    monkeypatch.setattr(module, "_make_hindsight_provider", lambda: EmptyRecallProvider())
+
+    def fake_contents(*_args, **_kwargs):
+        raise AssertionError("recall should not query source documents as fallback")
+
+    monkeypatch.setattr(module, "_hindsight_contents_payload", fake_contents)
+    payload = module._hindsight_payload(query="dashboard", limit=5, mode="recall")
+
+    assert payload["result_source"] == "hindsight_recall"
+    assert payload["result_count"] == 0
+    assert payload["results"] == []
+    assert "secret" not in json.dumps(payload)

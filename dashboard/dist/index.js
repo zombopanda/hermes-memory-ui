@@ -457,6 +457,144 @@
     );
   }
 
+
+  function HindsightResultRow(props) {
+    const result = props.result;
+    const metadata = result.metadata && Object.keys(result.metadata).length ? JSON.stringify(result.metadata) : "";
+    const typeLabel = result.display_type || result.type;
+    return e("div", { className: "memory-ui-fact" },
+      e("div", { className: "memory-ui-fact-top" },
+        e("div", { className: "memory-ui-fact-id" }, "#" + result.id),
+        result.score !== null && result.score !== undefined ? e(Badge, { variant: "outline" }, "score " + Number(result.score).toFixed(3)) : null,
+        typeLabel ? e(Badge, { variant: "outline" }, String(typeLabel).toUpperCase()) : null
+      ),
+      e("div", { className: "memory-ui-fact-content" }, result.text || ""),
+      metadata ? e("div", { className: "memory-ui-tags" }, "metadata: ", metadata) : null
+    );
+  }
+
+  function HindsightSection(props) {
+    const data = props.hindsight;
+    const [query, setQuery] = useState("");
+    const [limit, setLimit] = useState("25");
+    const [operationData, setOperationData] = useState(null);
+    const [contentsData, setContentsData] = useState(null);
+    const [operationLoading, setOperationLoading] = useState(false);
+    const [contentsLoading, setContentsLoading] = useState(false);
+    const [operationError, setOperationError] = useState(null);
+    const [contentsError, setContentsError] = useState(null);
+    if (!data) return null;
+
+    function runOperation(kind) {
+      if (!query.trim()) {
+        setOperationError("Enter a query first.");
+        return;
+      }
+      const p = new URLSearchParams();
+      p.set("query", query);
+      if (kind === "recall") p.set("limit", limit || "25");
+      setOperationLoading(true);
+      setOperationError(null);
+      SDK.fetchJSON("/api/plugins/hermes-memory-ui/hindsight/" + kind + "?" + p.toString())
+        .then(function (payload) { setOperationData(payload); })
+        .catch(function (err) { setOperationError(err && err.message ? err.message : String(err)); })
+        .finally(function () { setOperationLoading(false); });
+    }
+
+    function refreshContents() {
+      const p = new URLSearchParams();
+      p.set("limit", limit || "25");
+      if (query.trim()) p.set("search", query);
+      setContentsLoading(true);
+      setContentsError(null);
+      SDK.fetchJSON("/api/plugins/hermes-memory-ui/hindsight/contents?" + p.toString())
+        .then(function (payload) { setContentsData(payload); })
+        .catch(function (err) { setContentsError(err && err.message ? err.message : String(err)); })
+        .finally(function () { setContentsLoading(false); });
+    }
+
+    useEffect(function () { refreshContents(); }, []);
+
+    const results = operationData && operationData.results ? operationData.results : [];
+    const memoryItems = contentsData ? (contentsData.memories || []).map(function (item) { return Object.assign({}, item, { display_type: "memory" }); }) : [];
+    const documentItems = contentsData ? (contentsData.documents || []).map(function (item) { return Object.assign({}, item, { display_type: "document" }); }) : [];
+    const contentItems = memoryItems.concat(documentItems);
+    return e("div", { className: "memory-ui-section" },
+      e("div", { className: "memory-ui-section-header" },
+        e("div", null,
+          e("h2", null, "Hindsight memory"),
+          e("p", null, "Read-only view of Hindsight config and bank contents, plus explicit recall/reflect. No retain/write calls are exposed.")
+        ),
+        e("div", { className: "memory-ui-badges" },
+          e(Badge, { variant: data.provider_configured ? "outline" : "secondary" }, data.provider_configured ? "active provider" : "not active"),
+          e(Badge, { variant: "outline" }, data.mode || "cloud"),
+          e(Badge, { variant: data.api_key_present ? "outline" : "secondary" }, data.api_key_present ? "api key present" : "no api key"),
+          e(Badge, { variant: data.llm_key_present ? "outline" : "secondary" }, data.llm_key_present ? "LLM key present" : "no LLM key")
+        )
+      ),
+      e("div", { className: "memory-ui-grid-4" },
+        e(StatCard, { label: "Bank", value: data.bank_id || "—", hint: data.bank_id_template ? "template: " + data.bank_id_template : "resolved bank" }),
+        e(StatCard, { label: "Budget", value: data.recall_budget || "mid", hint: "recall budget" }),
+        e(StatCard, { label: "Memory mode", value: data.memory_mode || "hybrid", hint: "context/tools/hybrid" }),
+        e(StatCard, { label: "Auto", value: (data.auto_recall ? "recall" : "—") + " / " + (data.auto_retain ? "retain" : "—"), hint: "provider lifecycle" })
+      ),
+      e(Card, null,
+        e(CardContent, { className: "memory-ui-controls memory-ui-hindsight-controls" },
+          e("div", { className: "memory-ui-control" },
+            e("label", null, "Query / content filter"),
+            e(Input, {
+              value: query,
+              placeholder: "ask or filter Hindsight memory...",
+              onChange: function (ev) { setQuery(ev.target.value); }
+            })
+          ),
+          e("div", { className: "memory-ui-control" },
+            e("label", null, "Limit"),
+            e("select", {
+              className: "memory-ui-select",
+              value: limit,
+              onChange: function (ev) { setLimit(ev.target.value); }
+            },
+              e("option", { value: "10" }, "10"),
+              e("option", { value: "25" }, "25"),
+              e("option", { value: "50" }, "50"),
+              e("option", { value: "100" }, "100")
+            )
+          ),
+          e("div", { className: "memory-ui-hindsight-actions" },
+            e(Button, { onClick: function () { runOperation("recall"); }, className: "memory-ui-refresh", disabled: operationLoading }, operationLoading ? "Running..." : "Recall"),
+            e(Button, { onClick: function () { runOperation("reflect"); }, className: "memory-ui-refresh", disabled: operationLoading }, operationLoading ? "Running..." : "Reflect")
+          )
+        )
+      ),
+      e(ErrorBox, { error: data.error || operationError || contentsError || (operationData && operationData.error) || (contentsData && contentsData.error) }),
+      e("div", { className: "memory-ui-fact-list" },
+        e("div", { className: "memory-ui-contents-toolbar" },
+          e("div", { className: "memory-ui-muted" }, "Contents · memory units: ", contentsData ? (contentsData.memory_count || 0) : "—", " / ", contentsData ? (contentsData.total_memories || 0) : "—", " · documents: ", contentsData ? (contentsData.document_count || 0) : "—", " / ", contentsData ? (contentsData.total_documents || 0) : "—"),
+          e(Button, { onClick: refreshContents, className: "memory-ui-refresh", disabled: contentsLoading }, contentsLoading ? "Refreshing..." : "Refresh contents")
+        ),
+        contentsLoading && !contentsData ? e(EmptyState, null, "Loading Hindsight contents...") : null,
+        !contentsLoading && contentsData && contentItems.length
+          ? contentItems.map(function (result, index) { return e(HindsightResultRow, { key: "hindsight-content-" + index, result: result }); })
+          : null,
+        !contentsLoading && contentsData && !contentItems.length ? e(EmptyState, null, "No Hindsight contents returned.") : null,
+        !contentsLoading && !contentsData ? e(EmptyState, null, "Contents not loaded yet.") : null
+      ),
+      operationData && operationData.operation === "reflect" ? e(Card, null,
+        e(CardContent, null,
+          e("div", { className: "memory-ui-muted" }, "Reflection", operationData.reflection_source ? " · " + operationData.reflection_source : ""),
+          operationData.reflection ? e("div", { className: "memory-ui-fact-content memory-ui-path" }, operationData.reflection) : e(EmptyState, null, "No reflection returned.")
+        )
+      ) : null,
+      operationData && operationData.operation === "recall" ? e("div", { className: "memory-ui-fact-list" },
+        operationData.result_source ? e("div", { className: "memory-ui-muted" }, "Result source: ", operationData.result_source) : null,
+        results.length
+          ? results.map(function (result, index) { return e(HindsightResultRow, { key: "hindsight-" + index, result: result }); })
+          : e(EmptyState, null, operationData.error ? "Hindsight recall is unavailable." : "No memories returned for this query.")
+      ) : null
+    );
+  }
+
   function MemoryPage() {
     const [snapshot, setSnapshot] = useState(null);
     const [loading, setLoading] = useState(false);
@@ -487,10 +625,12 @@
     const holographic = snapshot && snapshot.holographic;
     const mem0 = snapshot && snapshot.mem0;
     const honcho = snapshot && snapshot.honcho;
+    const hindsight = snapshot && snapshot.hindsight;
     const showHolographic = !!(holographic && holographic.provider_configured);
     const showMem0 = !!(mem0 && mem0.provider_configured);
     const showHoncho = !!(honcho && honcho.provider_configured);
-    const heroGridClass = showHolographic || showMem0 || showHoncho ? "memory-ui-grid-4" : "memory-ui-grid-2";
+    const showHindsight = !!(hindsight && hindsight.provider_configured);
+    const heroGridClass = showHolographic || showMem0 || showHoncho || showHindsight ? "memory-ui-grid-4" : "memory-ui-grid-2";
 
     return e("div", { className: "memory-ui-page" },
       e(Card, { className: "memory-ui-hero" },
@@ -512,6 +652,7 @@
             showHolographic ? e(StatCard, { label: "Facts", value: holographic ? holographic.total_facts : 0, hint: "holographic facts" }) : null,
             showMem0 ? e(StatCard, { label: "Mem0", value: mem0 ? mem0.total_memories : 0, hint: "Mem0 memories" }) : null,
             showHoncho ? e(StatCard, { label: "Honcho", value: honcho ? ((honcho.user.card || []).length + (honcho.ai.card || []).length) : 0, hint: "peer card facts" }) : null,
+            showHindsight ? e(StatCard, { label: "Hindsight", value: hindsight ? (hindsight.bank_id || "active") : "—", hint: "query-only memory" }) : null,
             e(StatCard, { label: "Hermes home", value: builtin ? "active" : "—", hint: builtin ? builtin.hermes_home : "loading" }),
             e(StatCard, { label: "Generated", value: snapshot.generated_at ? fmtTime(snapshot.generated_at) : "—", hint: "snapshot time" })
           ) : e(EmptyState, null, "Loading memory snapshot...")
@@ -530,6 +671,10 @@
         showHoncho ? e(React.Fragment, null,
           e(Separator, null),
           e(HonchoSection, { honcho: honcho, filters: filters, setFilters: setFilters, refresh: refresh, loading: loading })
+        ) : null,
+        showHindsight ? e(React.Fragment, null,
+          e(Separator, null),
+          e(HindsightSection, { hindsight: hindsight })
         ) : null
       ) : null
     );

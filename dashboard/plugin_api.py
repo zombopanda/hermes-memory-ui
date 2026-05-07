@@ -3,19 +3,23 @@
 Mounted by Hermes dashboard at /api/plugins/hermes-memory-ui/.
 
 Read-only inspection covers built-in memory files, holographic memory,
-Mem0, and Honcho provider state. No mutation endpoints are exposed
+Mem0, Honcho, and Hindsight provider state. No mutation endpoints are exposed
 intentionally. Memory writes should go through Hermes' memory/fact_store
 tools or provider classes so validation, locking, FTS/HRR maintenance,
 and provider-specific semantics are preserved.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
+import subprocess
+import threading
 import time
+import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     from fastapi import APIRouter, Query
@@ -38,6 +42,11 @@ DEFAULT_MEM0_LIMIT = 500
 MAX_MEM0_LIMIT = 2000
 DEFAULT_HONCHO_LIMIT = 50
 MAX_HONCHO_LIMIT = 100
+DEFAULT_HINDSIGHT_LIMIT = 25
+MAX_HINDSIGHT_LIMIT = 100
+HINDSIGHT_DEFAULT_CLOUD_URL = "https://api.hindsight.vectorize.io"
+HINDSIGHT_DEFAULT_LOCAL_URL = "http://localhost:8888"
+VALID_HINDSIGHT_BUDGETS = {"low", "mid", "high"}
 
 
 def _hermes_home() -> Path:
@@ -58,6 +67,50 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_simple_env_file(path: Path) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not path.exists():
+        return values
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            text = line.strip()
+            if not text or text.startswith("#") or "=" not in text:
+                continue
+            key, value = text.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    except Exception:
+        return {}
+    return values
+
+
+def _env_value(key: str, default: str = "") -> str:
+    value = os.environ.get(key)
+    if value not in (None, ""):
+        return str(value)
+    file_env = _load_simple_env_file(_hermes_home() / ".env")
+    return file_env.get(key, default)
+
+
+def _truthy(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
 
 
 def _dig(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -707,6 +760,395 @@ def _honcho_payload(
     return base
 
 
+def _load_hindsight_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Load non-secret Hindsight configuration for dashboard inspection."""
+    config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
+    home = _hermes_home()
+    profile_path = home / "hindsight" / "config.json"
+    legacy_path = Path.home() / ".hindsight" / "config.json"
+    file_cfg: Dict[str, Any] = {}
+    config_path = profile_path
+    config_exists = profile_path.exists()
+    if config_exists:
+        file_cfg = _read_json(profile_path)
+    elif legacy_path.exists():
+        config_path = legacy_path
+        config_exists = True
+        file_cfg = _read_json(legacy_path)
+
+    mode = str(file_cfg.get("mode") or _env_value("HINDSIGHT_MODE", "cloud") or "cloud")
+    if mode == "local":
+        mode = "local_embedded"
+    api_key = file_cfg.get("apiKey") or file_cfg.get("api_key") or _env_value("HINDSIGHT_API_KEY", "")
+    llm_key = file_cfg.get("llmApiKey") or file_cfg.get("llm_api_key") or _env_value("HINDSIGHT_LLM_API_KEY", "")
+    default_url = HINDSIGHT_DEFAULT_LOCAL_URL if mode in {"local_embedded", "local_external"} else HINDSIGHT_DEFAULT_CLOUD_URL
+    api_url = file_cfg.get("api_url") or _env_value("HINDSIGHT_API_URL", default_url)
+    banks = file_cfg.get("banks") if isinstance(file_cfg.get("banks"), dict) else {}
+    hermes_bank = banks.get("hermes") if isinstance(banks.get("hermes"), dict) else {}
+    bank_id = file_cfg.get("bank_id") or hermes_bank.get("bankId") or _env_value("HINDSIGHT_BANK_ID", "hermes")
+    bank_template = file_cfg.get("bank_id_template", "") or ""
+    budget = file_cfg.get("recall_budget") or file_cfg.get("budget") or hermes_bank.get("budget") or _env_value("HINDSIGHT_BUDGET", "mid")
+    if budget not in VALID_HINDSIGHT_BUDGETS:
+        budget = "mid"
+    return {
+        "provider_configured": _dig(config, "memory", "provider", default=None) == "hindsight",
+        "config_path": str(config_path),
+        "config_exists": bool(config_exists),
+        "mode": mode,
+        "api_url": str(api_url),
+        "api_key_present": bool(api_key),
+        "llm_key_present": bool(llm_key),
+        "llm_provider": file_cfg.get("llm_provider") or "",
+        "llm_model": file_cfg.get("llm_model") or "",
+        "llm_base_url_present": bool(file_cfg.get("llm_base_url") or _env_value("HINDSIGHT_API_LLM_BASE_URL", "")),
+        "bank_id": str(bank_id or "hermes"),
+        "bank_id_template": str(bank_template),
+        "bank_mission": file_cfg.get("bank_mission", ""),
+        "bank_retain_mission": file_cfg.get("bank_retain_mission") or "",
+        "recall_budget": budget,
+        "recall_prefetch_method": file_cfg.get("recall_prefetch_method") or file_cfg.get("prefetch_method") or "recall",
+        "recall_max_tokens": file_cfg.get("recall_max_tokens", 4096),
+        "recall_max_input_chars": file_cfg.get("recall_max_input_chars", 800),
+        "recall_tags": file_cfg.get("recall_tags") or None,
+        "recall_tags_match": file_cfg.get("recall_tags_match", "any"),
+        "memory_mode": file_cfg.get("memory_mode", "hybrid"),
+        "auto_retain": _truthy(file_cfg.get("auto_retain"), True),
+        "auto_recall": _truthy(file_cfg.get("auto_recall"), True),
+        "retain_async": _truthy(file_cfg.get("retain_async"), True),
+        "retain_every_n_turns": file_cfg.get("retain_every_n_turns", 1),
+        "timeout": file_cfg.get("timeout") if file_cfg.get("timeout") is not None else _env_value("HINDSIGHT_TIMEOUT", "120"),
+        "idle_timeout": file_cfg.get("idle_timeout") if file_cfg.get("idle_timeout") is not None else _env_value("HINDSIGHT_IDLE_TIMEOUT", "300"),
+        "profile": file_cfg.get("profile", "hermes"),
+        "_api_key": api_key,
+        "_file_config": file_cfg,
+    }
+
+
+def _normalize_hindsight_result(item: Any, index: int) -> Dict[str, Any]:
+    data = _object_to_dict(item)
+
+    def attr(name: str, default: Any = None) -> Any:
+        if name in data:
+            return data.get(name)
+        value = getattr(item, name, default)
+        return default if callable(value) else value
+
+    text = attr("text") or attr("content") or attr("memory") or attr("document") or ""
+    metadata = attr("metadata", {})
+    return {
+        "id": attr("id") or attr("document_id") or attr("uuid") or str(index + 1),
+        "text": str(text),
+        "score": attr("score") or attr("relevance") or attr("similarity"),
+        "type": attr("type") or attr("kind"),
+        "metadata": _json_safe(metadata if isinstance(metadata, dict) else {}),
+    }
+
+
+def _hindsight_should_manage_local_daemon(cfg: Dict[str, Any]) -> bool:
+    if cfg.get("mode") != "local_embedded":
+        return False
+    parsed = urllib.parse.urlparse(str(cfg.get("api_url") or HINDSIGHT_DEFAULT_LOCAL_URL))
+    return parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def _ensure_hindsight_local_daemon(cfg: Dict[str, Any]) -> Optional[str]:
+    """Best-effort start for local_embedded Hindsight before client calls."""
+    if not _hindsight_should_manage_local_daemon(cfg):
+        return None
+    profile = str(cfg.get("profile") or "hermes")
+    cmd = ["hindsight-embed", "-p", profile, "daemon", "start"]
+    env = os.environ.copy()
+    env.setdefault("HERMES_HOME", str(_hermes_home()))
+    try:
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        return "hindsight-embed command not found in dashboard environment"
+    except Exception as exc:
+        return f"Could not start local Hindsight daemon: {exc}"
+    if result.returncode not in (0,):
+        output = (result.stderr or result.stdout or "").strip()
+        return output or f"hindsight-embed daemon start exited with {result.returncode}"
+    return None
+
+
+def _run_coro_blocking(coro: Any) -> Any:
+    """Run a coroutine from sync dashboard helper code, even inside FastAPI's event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: Dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # pragma: no cover - re-raised in caller thread
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+def _hindsight_timeout_seconds(cfg: Dict[str, Any]) -> float:
+    try:
+        return float(cfg.get("timeout") or 120)
+    except Exception:
+        return 120.0
+
+
+def _hindsight_connection_failed(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "connection refused" in text or "cannot connect" in text or "connect call failed" in text
+
+
+def _hindsight_client_call(cfg: Dict[str, Any], fn: Callable[[Any], Any]) -> Any:
+    """Call the official Hindsight client for read-only inspection operations."""
+
+    async def invoke() -> Any:
+        from hindsight_client import Hindsight  # type: ignore
+
+        client = Hindsight(
+            base_url=str(cfg.get("api_url") or HINDSIGHT_DEFAULT_LOCAL_URL).rstrip("/"),
+            api_key=cfg.get("_api_key") or None,
+            timeout=_hindsight_timeout_seconds(cfg),
+            user_agent="hermes-memory-ui-dashboard/0.4.4",
+        )
+        try:
+            return await fn(client)
+        finally:
+            await client.aclose()
+
+    try:
+        return _run_coro_blocking(invoke())
+    except Exception as exc:
+        if _hindsight_connection_failed(exc):
+            start_error = _ensure_hindsight_local_daemon(cfg)
+            if start_error:
+                raise RuntimeError(start_error) from exc
+            return _run_coro_blocking(invoke())
+        raise
+
+
+def _normalize_hindsight_document(item: Any, index: int) -> Dict[str, Any]:
+    data = item if isinstance(item, dict) else _object_to_dict(item)
+
+    def attr(name: str, default: Any = None) -> Any:
+        if isinstance(data, dict) and name in data:
+            return data.get(name)
+        value = getattr(item, name, default)
+        return default if callable(value) else value
+
+    text = attr("original_text") or attr("text") or attr("content") or ""
+    doc_metadata = attr("document_metadata", {}) or attr("metadata", {}) or {}
+    return {
+        "id": attr("id") or attr("document_id") or str(index + 1),
+        "text": str(text),
+        "type": "document",
+        "score": None,
+        "metadata": {
+            "source": "hindsight_client_documents",
+            "memory_unit_count": attr("memory_unit_count"),
+            "text_length": attr("text_length") or len(str(text)),
+            "created_at": _json_safe(attr("created_at")),
+            "updated_at": _json_safe(attr("updated_at")),
+            "tags": attr("tags", []) or [],
+            "retain_params": _json_safe(attr("retain_params")),
+            "document_metadata": _json_safe(doc_metadata if isinstance(doc_metadata, dict) else {}),
+        },
+    }
+
+
+def _hindsight_contents_payload(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = DEFAULT_HINDSIGHT_LIMIT,
+    search: Optional[str] = None,
+) -> Dict[str, Any]:
+    """List visible Hindsight memory units and source documents via hindsight_client."""
+    config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
+    cfg = _load_hindsight_config(config)
+    try:
+        limit = int(limit or DEFAULT_HINDSIGHT_LIMIT)
+    except Exception:
+        limit = DEFAULT_HINDSIGHT_LIMIT
+    limit = max(1, min(limit, MAX_HINDSIGHT_LIMIT))
+    search = search if isinstance(search, str) and search.strip() else None
+    bank_id = str(cfg.get("bank_id") or "hermes")
+    base = _hindsight_config_payload(config)
+    base.update({
+        "operation": "contents",
+        "search": search or "",
+        "limit": limit,
+        "memories": [],
+        "memory_count": 0,
+        "total_memories": 0,
+        "documents": [],
+        "document_count": 0,
+        "total_documents": 0,
+        "stats": {},
+    })
+    try:
+        async def fetch_contents(client: Any) -> Dict[str, Any]:
+            stats_resp = await client.banks.get_agent_stats(
+                bank_id=bank_id,
+                _request_timeout=_hindsight_timeout_seconds(cfg),
+            )
+            memories_resp = await client.memory.list_memories(
+                bank_id=bank_id,
+                q=search,
+                limit=limit,
+                offset=0,
+                _request_timeout=_hindsight_timeout_seconds(cfg),
+            )
+            docs_resp = await client.documents.list_documents(
+                bank_id=bank_id,
+                q=None,
+                limit=max(limit, 100),
+                offset=0,
+                _request_timeout=_hindsight_timeout_seconds(cfg),
+            )
+            docs_items = list(getattr(docs_resp, "items", None) or [])
+            detailed_docs: List[Dict[str, Any]] = []
+            for item in docs_items[: max(limit, 100)]:
+                doc_id = getattr(item, "id", None) or (_object_to_dict(item).get("id") if item is not None else None)
+                doc_data = item
+                if doc_id:
+                    try:
+                        doc_data = await client.documents.get_document(
+                            bank_id=bank_id,
+                            document_id=str(doc_id),
+                            _request_timeout=_hindsight_timeout_seconds(cfg),
+                        )
+                    except Exception:
+                        doc_data = item
+                normalized = _normalize_hindsight_document(doc_data, len(detailed_docs))
+                if search:
+                    haystack = (normalized.get("text", "") + " " + normalized.get("id", "") + " " + json.dumps(normalized.get("metadata", {}))).casefold()
+                    if search.casefold() not in haystack:
+                        continue
+                detailed_docs.append(normalized)
+                if len(detailed_docs) >= limit:
+                    break
+            memories_items = list(getattr(memories_resp, "items", None) or [])
+            return {
+                "stats": _json_safe(_object_to_dict(stats_resp)),
+                "memories": [_normalize_hindsight_result(item, index) for index, item in enumerate(memories_items[:limit])],
+                "total_memories": getattr(memories_resp, "total", len(memories_items)) or len(memories_items),
+                "documents": detailed_docs,
+                "total_documents": getattr(docs_resp, "total", len(docs_items)) or len(docs_items),
+            }
+
+        content = _hindsight_client_call(cfg, fetch_contents)
+        base["stats"] = content.get("stats", {})
+        base["memories"] = content.get("memories", [])
+        base["memory_count"] = len(base["memories"])
+        base["total_memories"] = content.get("total_memories", base["memory_count"])
+        base["documents"] = content.get("documents", [])
+        base["document_count"] = len(base["documents"])
+        base["total_documents"] = content.get("total_documents", base["document_count"])
+    except Exception as exc:
+        base["error"] = str(exc)
+    return base
+
+
+def _make_hindsight_provider() -> Any:
+    from plugins.memory.hindsight import HindsightMemoryProvider  # type: ignore
+
+    provider = HindsightMemoryProvider()
+    provider.initialize(session_id="dashboard", hermes_home=str(_hermes_home()), platform="dashboard")
+    return provider
+
+
+def _hindsight_config_payload(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = _load_hindsight_config(config)
+    public = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    public.update({
+        "id": "hindsight",
+        "label": "Hindsight memory",
+        "mode_label": "query-only",
+        "generated_at": time.time(),
+        "error": None,
+    })
+    return public
+
+
+def _hindsight_payload(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    query: Optional[str] = None,
+    limit: int = DEFAULT_HINDSIGHT_LIMIT,
+    mode: str = "status",
+) -> Dict[str, Any]:
+    config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
+    query = query if isinstance(query, str) and query.strip() else None
+    try:
+        limit = int(limit or DEFAULT_HINDSIGHT_LIMIT)
+    except Exception:
+        limit = DEFAULT_HINDSIGHT_LIMIT
+    limit = max(1, min(limit, MAX_HINDSIGHT_LIMIT))
+    base = _hindsight_config_payload(config)
+    base.update({
+        "operation": mode,
+        "query": query or "",
+        "limit": limit,
+        "results": [],
+        "result_count": 0,
+        "reflection": "",
+    })
+    if mode == "status":
+        return base
+    if mode not in {"recall", "reflect"}:
+        base["error"] = f"Unsupported Hindsight operation: {mode}"
+        return base
+    if not query:
+        base["error"] = "Query is required for Hindsight recall/reflect."
+        return base
+    provider = None
+    try:
+        provider = _make_hindsight_provider()
+        if mode == "reflect":
+            response = provider._run_hindsight_operation(
+                lambda client: client.areflect(bank_id=provider._bank_id, query=query, budget=provider._budget)
+            )
+            base["reflection_source"] = "hindsight_reflect"
+            base["reflection"] = str(getattr(response, "text", "") or "")
+            return base
+        recall_kwargs: Dict[str, Any] = {
+            "bank_id": provider._bank_id,
+            "query": query,
+            "budget": provider._budget,
+            "max_tokens": provider._recall_max_tokens,
+        }
+        if getattr(provider, "_recall_tags", None):
+            recall_kwargs["tags"] = provider._recall_tags
+            recall_kwargs["tags_match"] = provider._recall_tags_match
+        if getattr(provider, "_recall_types", None):
+            recall_kwargs["types"] = provider._recall_types
+        response = provider._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+        raw_results = list(getattr(response, "results", None) or [])[:limit]
+        base["results"] = [_normalize_hindsight_result(item, index) for index, item in enumerate(raw_results)]
+        base["result_source"] = "hindsight_recall"
+        base["result_count"] = len(base["results"])
+    except Exception as exc:
+        base["error"] = str(exc)
+    finally:
+        shutdown = getattr(provider, "shutdown", None) if provider is not None else None
+        if callable(shutdown):
+            try:
+                import contextlib
+                import io
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    shutdown()
+            except Exception:
+                pass
+    return base
+
+
 @router.get("/status")
 async def status() -> Dict[str, Any]:
     home = _hermes_home()
@@ -714,9 +1156,10 @@ async def status() -> Dict[str, Any]:
     db_path = _resolve_holographic_db(config)
     mem0_cfg = _load_mem0_config(config)
     honcho_cfg = _honcho_config_payload(config)
+    hindsight_cfg = _load_hindsight_config(config)
     return {
         "plugin": "hermes-memory-ui",
-        "version": "0.3.0",
+        "version": "0.4.4",
         "mode": "read-only",
         "hermes_home": str(home),
         "config_path": str(home / "config.yaml"),
@@ -754,6 +1197,23 @@ async def status() -> Dict[str, Any]:
             "session_strategy": honcho_cfg["session_strategy"],
             "provider_configured": _dig(config, "memory", "provider", default=None) == "honcho",
         },
+        "hindsight": {
+            "config_path": hindsight_cfg["config_path"],
+            "config_exists": hindsight_cfg["config_exists"],
+            "mode": hindsight_cfg["mode"],
+            "api_url": hindsight_cfg["api_url"],
+            "api_key_present": hindsight_cfg["api_key_present"],
+            "llm_key_present": hindsight_cfg["llm_key_present"],
+            "llm_provider": hindsight_cfg["llm_provider"],
+            "llm_model": hindsight_cfg["llm_model"],
+            "bank_id": hindsight_cfg["bank_id"],
+            "bank_id_template": hindsight_cfg["bank_id_template"],
+            "recall_budget": hindsight_cfg["recall_budget"],
+            "memory_mode": hindsight_cfg["memory_mode"],
+            "auto_retain": hindsight_cfg["auto_retain"],
+            "auto_recall": hindsight_cfg["auto_recall"],
+            "provider_configured": hindsight_cfg["provider_configured"],
+        },
         "generated_at": time.time(),
     }
 
@@ -789,6 +1249,34 @@ async def honcho(
     return _honcho_payload(limit=limit, search=search or None)
 
 
+@router.get("/hindsight")
+async def hindsight() -> Dict[str, Any]:
+    return _hindsight_payload(mode="status")
+
+
+@router.get("/hindsight/contents")
+async def hindsight_contents(
+    limit: int = Query(DEFAULT_HINDSIGHT_LIMIT, ge=1, le=MAX_HINDSIGHT_LIMIT),
+    search: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    return _hindsight_contents_payload(limit=limit, search=search or None)
+
+
+@router.get("/hindsight/recall")
+async def hindsight_recall(
+    query: str = Query(...),
+    limit: int = Query(DEFAULT_HINDSIGHT_LIMIT, ge=1, le=MAX_HINDSIGHT_LIMIT),
+) -> Dict[str, Any]:
+    return _hindsight_payload(query=query, limit=limit, mode="recall")
+
+
+@router.get("/hindsight/reflect")
+async def hindsight_reflect(
+    query: str = Query(...),
+) -> Dict[str, Any]:
+    return _hindsight_payload(query=query, limit=1, mode="reflect")
+
+
 @router.get("/snapshot")
 async def snapshot(
     limit: int = Query(DEFAULT_FACT_LIMIT, ge=1, le=MAX_FACT_LIMIT),
@@ -799,7 +1287,7 @@ async def snapshot(
     config = _read_yaml(_hermes_home() / "config.yaml")
     return {
         "plugin": "hermes-memory-ui",
-        "version": "0.3.0",
+        "version": "0.4.4",
         "mode": "read-only",
         "builtin": _builtin_payload(config),
         "holographic": _holographic_payload(
@@ -811,5 +1299,6 @@ async def snapshot(
         ),
         "mem0": _mem0_payload(config, limit=limit, search=search or None),
         "honcho": _honcho_payload(config, limit=limit, search=search or None),
+        "hindsight": _hindsight_payload(config, mode="status"),
         "generated_at": time.time(),
     }

@@ -236,9 +236,33 @@
   grid-template-columns: minmax(220px, 1.4fr) minmax(130px, 0.35fr) auto;
 }
 
+.memory-ui-hindsight-controls {
+  grid-template-columns: minmax(220px, 1fr) minmax(130px, 0.24fr) auto;
+}
+
+.memory-ui-hindsight-actions,
+.memory-ui-contents-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.memory-ui-hindsight-actions {
+  justify-content: flex-end;
+}
+
+.memory-ui-contents-toolbar {
+  justify-content: space-between;
+  margin-bottom: 0.1rem;
+}
+
 @media (max-width: 1050px) {
   .memory-ui-controls {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .memory-ui-hindsight-actions {
+    justify-content: flex-start;
   }
 }
 

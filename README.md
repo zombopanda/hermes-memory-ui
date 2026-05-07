@@ -17,6 +17,10 @@ Current scope:
   * Honcho memory:
     + read-only Honcho workspace, host, peer, and provider configuration state
     + user/AI peer cards, representations, conclusions, and context search
+  * Hindsight memory:
+    + read-only/query-only Hindsight provider configuration state
+    + explicit recall and reflect actions; no automatic retain/write flow
+    + contents view via the official Hindsight client for memory units and retained source documents
 
 This plugin is intentionally read-only. It does not add, edit, replace, or remove memories. That is deliberate: writes should go through Hermes' `memory` and `fact_store` tools or provider classes so validation, locking, mirroring, FTS, HRR vectors, and memory-bank maintenance are preserved.
 
@@ -98,6 +102,7 @@ Top summary:
 - holographic total fact count only when `memory.provider` is currently `holographic`
 - Mem0 memory count only when `memory.provider` is currently `mem0`
 - Honcho peer-card fact count only when `memory.provider` is currently `honcho`
+- Hindsight bank/status only when `memory.provider` is currently `hindsight`
 
 Built-in memory section:
 
@@ -134,6 +139,16 @@ Honcho memory section, displayed when `memory.provider` is currently `honcho`:
 - user and AI representations
 - conclusions returned for user and AI peers
 - context search after clicking `Apply / refresh` button
+
+Hindsight memory section, displayed when `memory.provider` is currently `hindsight`:
+
+- whether Hindsight is the active provider
+- resolved mode, API URL, bank, budget, memory mode, and auto-retain/auto-recall flags
+- whether API/LLM keys are present, without exposing secrets
+- explicit `Recall` query button for ranked memory retrieval
+- explicit `Reflect` query button for synthesis over memories
+- automatically displayed Hindsight contents with a `Refresh contents` button for extracted memory units plus retained source documents
+- no retain/write endpoint
 
 ## Holographic DB path resolution
 
@@ -212,6 +227,29 @@ The plugin performs read-only calls such as:
 
 It does not call Honcho dialectic reasoning (`peer.chat()` / `honcho_reasoning`) automatically from page load or `/snapshot`.
 
+## Hindsight configuration
+
+Hindsight support follows Hermes' bundled `hindsight` memory provider convention. The plugin reads non-secret configuration from:
+
+- `$HERMES_HOME/hindsight/config.json`
+- legacy `~/.hindsight/config.json`
+- environment variables such as `HINDSIGHT_MODE`, `HINDSIGHT_API_URL`, `HINDSIGHT_BANK_ID`, and `HINDSIGHT_BUDGET`
+
+Secrets such as `HINDSIGHT_API_KEY` and `HINDSIGHT_LLM_API_KEY` are only detected as boolean `*_present` flags and are never returned in plugin responses. Hindsight is query-oriented rather than a complete list API, so the dashboard only calls recall/reflect after the user clicks a button. `/snapshot` and page load include status/config only.
+
+The plugin performs read-only/query-only calls through Hermes' Hindsight provider internals and the official `hindsight_client` SDK:
+
+- `HindsightMemoryProvider.initialize(...)`
+- `client.arecall(...)` for explicit recall
+- `client.areflect(...)` for explicit reflection
+- `Hindsight(...).memory.list_memories(...)` for visible memory units
+- `Hindsight(...).documents.list_documents(...)` and `get_document(...)` for retained source documents
+- `Hindsight(...).banks.get_agent_stats(...)` for bank counts/status
+
+Recall and reflect show only native Hindsight results. Retained source documents are displayed separately in the contents view; they are not used as a fallback for recall or reflect.
+
+It does not expose `hindsight_retain` or any write UI.
+
 ## API endpoints
 
 Hermes mounts this plugin under:
@@ -224,7 +262,7 @@ Available API endpoints:
 
 ### GET `/status`
 
-Returns plugin status, active Hermes home, configured memory provider, built-in memory paths, holographic DB path, Mem0 configuration status, and Honcho configuration status.
+Returns plugin status, active Hermes home, configured memory provider, built-in memory paths, holographic DB path, Mem0 configuration status, Honcho configuration status, and Hindsight configuration status.
 
 Example:
 
@@ -290,9 +328,55 @@ Example:
 curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/honcho?limit=25&search=dashboard' | jq
 ```
 
+### GET `/hindsight`
+
+Returns Hindsight provider status/config only. It does not run recall or reflect.
+
+### GET `/hindsight/contents`
+
+Lists Hindsight memory units and retained source documents through the official `hindsight_client` SDK. This is read-only. The UI loads it for the Hindsight section and also provides a manual `Refresh contents` action.
+
+Query parameters:
+
+- `search`: optional text filter applied to memory/document text, IDs, tags, and metadata
+- `limit`: optional, defaults to 25, capped at 100
+
+```bash
+curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/hindsight/contents?search=dashboard&limit=25' | jq
+```
+
+### GET `/hindsight/recall`
+
+Runs explicit Hindsight recall.
+
+Query parameters:
+
+- `query`: required query string
+- `limit`: 1-100, default 25
+
+Example:
+
+```bash
+curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/hindsight/recall?query=dashboard&limit=25' | jq
+```
+
+### GET `/hindsight/reflect`
+
+Runs explicit Hindsight reflect/synthesis.
+
+Query parameters:
+
+- `query`: required query string
+
+Example:
+
+```bash
+curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/hindsight/reflect?query=dashboard' | jq
+```
+
 ### GET `/snapshot`
 
-Combined payload used by the UI. Accepts the same query parameters as `/holographic`; `limit` and `search` are also applied to Mem0 and Honcho, with Honcho internally capped at 100.
+Combined payload used by the UI. Accepts the same query parameters as `/holographic`; `limit` and `search` are also applied to Mem0 and Honcho, with Honcho internally capped at 100. Hindsight in `/snapshot` is status/config only and does not query recall/reflect.
 
 ```bash
 curl http://127.0.0.1:9119/api/plugins/hermes-memory-ui/snapshot | jq
@@ -336,7 +420,7 @@ Plugin extensions to consider (**feel free to contribute!**):
    - `HolographicAdapter`
    - `Mem0Adapter`
    - `HonchoAdapter`
-   - future `HindsightAdapter`
+   - `HindsightAdapter`
 
 3. Diff and hygiene tools
    - find duplicates
@@ -418,7 +502,7 @@ The plugin script is loading before or outside the Hermes dashboard plugin runti
 - Mem0 API mode depends on the `mem0ai` package being installed in the dashboard environment and a configured Mem0 API key.
 - Local `mem0.Memory` stores are not supported; this plugin mirrors Hermes' current cloud/API-oriented Mem0 provider.
 - Honcho support depends on Hermes' bundled Honcho provider helpers and a configured Honcho API key or base URL.
-- Hindsight and other memory providers are not implemented.
+- Hindsight support depends on Hermes' bundled Hindsight provider helpers and a configured Hindsight Cloud/local setup.
 - No pagination yet; use `limit` filter.
 
 ## License
