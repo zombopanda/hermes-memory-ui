@@ -42,6 +42,10 @@ Honcho memory view:
 
 ![Hermes Memory UI Honcho memory view](docs/assets/hermes-memory-dashboard4.png)
 
+Hindsight memory view:
+
+![Hermes Memory UI Hindsight memory view](docs/assets/hermes-memory-dashboard5.png)
+
 ## Requirements
 
 - Hermes Agent with web dashboard support.
@@ -143,11 +147,11 @@ Honcho memory section, displayed when `memory.provider` is currently `honcho`:
 Hindsight memory section, displayed when `memory.provider` is currently `hindsight`:
 
 - whether Hindsight is the active provider
-- resolved mode, API URL, bank, budget, memory mode, and auto-retain/auto-recall flags
+- resolved mode, bank, budget, memory mode, and auto-retain/auto-recall flags
 - whether API/LLM keys are present, without exposing secrets
 - explicit `Recall` query button for ranked memory retrieval
 - explicit `Reflect` query button for synthesis over memories
-- automatically displayed Hindsight contents with a `Refresh contents` button for extracted memory units plus retained source documents
+- automatically displayed Hindsight contents with a `Refresh` button for extracted memory units plus retained source documents
 - no retain/write endpoint
 
 ## Holographic DB path resolution

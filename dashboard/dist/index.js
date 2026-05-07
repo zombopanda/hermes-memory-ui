@@ -568,18 +568,6 @@
         )
       ),
       e(ErrorBox, { error: data.error || operationError || contentsError || (operationData && operationData.error) || (contentsData && contentsData.error) }),
-      e("div", { className: "memory-ui-fact-list" },
-        e("div", { className: "memory-ui-contents-toolbar" },
-          e("div", { className: "memory-ui-muted" }, "Contents · memory units: ", contentsData ? (contentsData.memory_count || 0) : "—", " / ", contentsData ? (contentsData.total_memories || 0) : "—", " · documents: ", contentsData ? (contentsData.document_count || 0) : "—", " / ", contentsData ? (contentsData.total_documents || 0) : "—"),
-          e(Button, { onClick: refreshContents, className: "memory-ui-refresh", disabled: contentsLoading }, contentsLoading ? "Refreshing..." : "Refresh contents")
-        ),
-        contentsLoading && !contentsData ? e(EmptyState, null, "Loading Hindsight contents...") : null,
-        !contentsLoading && contentsData && contentItems.length
-          ? contentItems.map(function (result, index) { return e(HindsightResultRow, { key: "hindsight-content-" + index, result: result }); })
-          : null,
-        !contentsLoading && contentsData && !contentItems.length ? e(EmptyState, null, "No Hindsight contents returned.") : null,
-        !contentsLoading && !contentsData ? e(EmptyState, null, "Contents not loaded yet.") : null
-      ),
       operationData && operationData.operation === "reflect" ? e(Card, null,
         e(CardContent, null,
           e("div", { className: "memory-ui-muted" }, "Reflection", operationData.reflection_source ? " · " + operationData.reflection_source : ""),
@@ -591,7 +579,19 @@
         results.length
           ? results.map(function (result, index) { return e(HindsightResultRow, { key: "hindsight-" + index, result: result }); })
           : e(EmptyState, null, operationData.error ? "Hindsight recall is unavailable." : "No memories returned for this query.")
-      ) : null
+      ) : null,
+      e("div", { className: "memory-ui-fact-list" },
+        e("div", { className: "memory-ui-contents-toolbar" },
+          e("div", { className: "memory-ui-muted" }, "Contents · memory units: ", contentsData ? (contentsData.memory_count || 0) : "—", " / ", contentsData ? (contentsData.total_memories || 0) : "—", " · documents: ", contentsData ? (contentsData.document_count || 0) : "—", " / ", contentsData ? (contentsData.total_documents || 0) : "—"),
+          e(Button, { onClick: refreshContents, className: "memory-ui-refresh", disabled: contentsLoading }, contentsLoading ? "Refreshing..." : "Refresh contents")
+        ),
+        contentsLoading && !contentsData ? e(EmptyState, null, "Loading Hindsight contents...") : null,
+        !contentsLoading && contentsData && contentItems.length
+          ? contentItems.map(function (result, index) { return e(HindsightResultRow, { key: "hindsight-content-" + index, result: result }); })
+          : null,
+        !contentsLoading && contentsData && !contentItems.length ? e(EmptyState, null, "No Hindsight contents returned.") : null,
+        !contentsLoading && !contentsData ? e(EmptyState, null, "Contents not loaded yet.") : null
+      )
     );
   }
 
