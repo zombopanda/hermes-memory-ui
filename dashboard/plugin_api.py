@@ -916,7 +916,7 @@ def _hindsight_client_call(cfg: Dict[str, Any], fn: Callable[[Any], Any]) -> Any
             base_url=str(cfg.get("api_url") or HINDSIGHT_DEFAULT_LOCAL_URL).rstrip("/"),
             api_key=cfg.get("_api_key") or None,
             timeout=_hindsight_timeout_seconds(cfg),
-            user_agent="hermes-memory-ui-dashboard/0.4.5",
+            user_agent="hermes-memory-ui-dashboard/0.4.6",
         )
         try:
             return await fn(client)
@@ -1159,7 +1159,7 @@ async def status() -> Dict[str, Any]:
     hindsight_cfg = _load_hindsight_config(config)
     return {
         "plugin": "hermes-memory-ui",
-        "version": "0.4.5",
+        "version": "0.4.6",
         "mode": "read-only",
         "hermes_home": str(home),
         "config_path": str(home / "config.yaml"),
@@ -1287,7 +1287,7 @@ async def snapshot(
     config = _read_yaml(_hermes_home() / "config.yaml")
     return {
         "plugin": "hermes-memory-ui",
-        "version": "0.4.5",
+        "version": "0.4.6",
         "mode": "read-only",
         "builtin": _builtin_payload(config),
         "holographic": _holographic_payload(
