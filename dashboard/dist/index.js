@@ -595,6 +595,161 @@
     );
   }
 
+  function MnemosyneResultRow(props) {
+    const result = props.result;
+    const metadata = result.metadata && Object.keys(result.metadata).length ? JSON.stringify(result.metadata) : "";
+    const typeLabel = result.display_type || result.type;
+    return e("div", { className: "memory-ui-fact" },
+      e("div", { className: "memory-ui-fact-top" },
+        e("div", { className: "memory-ui-fact-id" }, "#" + result.id),
+        result.score !== null && result.score !== undefined ? e(Badge, { variant: "outline" }, "score " + Number(result.score).toFixed(3)) : null,
+        typeLabel ? e(Badge, { variant: "outline" }, String(typeLabel).toUpperCase()) : null,
+        result.source ? e(Badge, { variant: "outline" }, String(result.source)) : null
+      ),
+      e("div", { className: "memory-ui-fact-content" }, result.text || ""),
+      metadata ? e("div", { className: "memory-ui-tags" }, "metadata: ", metadata) : null,
+      result.timestamp || result.created_at ? e("div", { className: "memory-ui-muted" }, "Time: ", fmtTime(result.timestamp || result.created_at)) : null
+    );
+  }
+
+  function MnemosyneSection(props) {
+    const data = props.mnemosyne;
+    const [query, setQuery] = useState("");
+    const [limit, setLimit] = useState("25");
+    const [temporalWeight, setTemporalWeight] = useState("0.2");
+    const [operationData, setOperationData] = useState(null);
+    const [contentsData, setContentsData] = useState(null);
+    const [operationLoading, setOperationLoading] = useState(false);
+    const [contentsLoading, setContentsLoading] = useState(false);
+    const [operationError, setOperationError] = useState(null);
+    const [contentsError, setContentsError] = useState(null);
+    if (!data) return null;
+
+    function runOperation(kind) {
+      if (!query.trim()) {
+        setOperationError("Enter a query first.");
+        return;
+      }
+      const p = new URLSearchParams();
+      p.set("query", query);
+      if (kind === "recall") {
+        p.set("limit", limit || "25");
+        p.set("temporal_weight", temporalWeight || "0.2");
+      }
+      setOperationLoading(true);
+      setOperationError(null);
+      SDK.fetchJSON("/api/plugins/hermes-memory-ui/mnemosyne/" + kind + "?" + p.toString())
+        .then(function (payload) { setOperationData(payload); })
+        .catch(function (err) { setOperationError(err && err.message ? err.message : String(err)); })
+        .finally(function () { setOperationLoading(false); });
+    }
+
+    function refreshContents() {
+      const p = new URLSearchParams();
+      p.set("limit", limit || "25");
+      if (query.trim()) p.set("search", query);
+      setContentsLoading(true);
+      setContentsError(null);
+      SDK.fetchJSON("/api/plugins/hermes-memory-ui/mnemosyne/contents?" + p.toString())
+        .then(function (payload) { setContentsData(payload); })
+        .catch(function (err) { setContentsError(err && err.message ? err.message : String(err)); })
+        .finally(function () { setContentsLoading(false); });
+    }
+
+    const visibleContents = contentsData || data;
+    const results = operationData && operationData.results ? operationData.results : [];
+    const memoryItems = (visibleContents.memories || []).map(function (item) { return Object.assign({}, item, { display_type: "memory" }); });
+    const factItems = (visibleContents.facts || []).map(function (item) { return Object.assign({}, item, { display_type: "fact" }); });
+    const contentItems = memoryItems.concat(factItems);
+    return e("div", { className: "memory-ui-section" },
+      e("div", { className: "memory-ui-section-header" },
+        e("div", null,
+          e("h2", null, "Mnemosyne memory"),
+          e("p", null, "Read-only view of the local Mnemosyne SQLite store, plus explicit recall and injected-context preview.")
+        ),
+        e("div", { className: "memory-ui-badges" },
+          e(Badge, { variant: data.provider_configured ? "outline" : "secondary" }, data.provider_configured ? "active provider" : "not active"),
+          e(Badge, { variant: data.db_exists ? "outline" : "secondary" }, data.db_exists ? "db found" : "db missing"),
+          e(Badge, { variant: "outline" }, data.auto_sleep_enabled ? "sleep on" : "sleep off")
+        )
+      ),
+      e("div", { className: "memory-ui-grid-4" },
+        e(StatCard, { label: "Episodes", value: visibleContents.total_memories || 0, hint: "episodic + working rows" }),
+        e(StatCard, { label: "Facts", value: visibleContents.total_facts || 0, hint: "memoria facts and graph rows" }),
+        e(StatCard, { label: "Vectors", value: visibleContents.vector_rows || 0, hint: "sqlite-vec row index" }),
+        e(StatCard, { label: "Prefetch chars", value: data.prefetch_content_chars || "default", hint: "auto-inject budget" })
+      ),
+      e(Card, null,
+        e(CardContent, { className: "memory-ui-controls memory-ui-provider-controls" },
+          e("div", { className: "memory-ui-control" },
+            e("label", null, "Query / content filter"),
+            e(Input, {
+              value: query,
+              placeholder: "ask or filter Mnemosyne memory...",
+              onChange: function (ev) { setQuery(ev.target.value); }
+            })
+          ),
+          e("div", { className: "memory-ui-control" },
+            e("label", null, "Limit"),
+            e("select", {
+              className: "memory-ui-select",
+              value: limit,
+              onChange: function (ev) { setLimit(ev.target.value); }
+            },
+              e("option", { value: "10" }, "10"),
+              e("option", { value: "25" }, "25"),
+              e("option", { value: "50" }, "50"),
+              e("option", { value: "100" }, "100")
+            )
+          ),
+          e("div", { className: "memory-ui-control" },
+            e("label", null, "Temporal"),
+            e("select", {
+              className: "memory-ui-select",
+              value: temporalWeight,
+              onChange: function (ev) { setTemporalWeight(ev.target.value); }
+            },
+              e("option", { value: "0" }, "0.0"),
+              e("option", { value: "0.2" }, "0.2"),
+              e("option", { value: "0.5" }, "0.5"),
+              e("option", { value: "0.8" }, "0.8"),
+              e("option", { value: "1" }, "1.0")
+            )
+          ),
+          e("div", { className: "memory-ui-provider-actions" },
+            e(Button, { onClick: function () { runOperation("recall"); }, className: "memory-ui-refresh", disabled: operationLoading }, operationLoading ? "Running..." : "Recall"),
+            e(Button, { onClick: function () { runOperation("prefetch"); }, className: "memory-ui-refresh", disabled: operationLoading }, operationLoading ? "Running..." : "Preview inject")
+          )
+        )
+      ),
+      e(ErrorBox, { error: data.error || operationError || contentsError || (operationData && operationData.error) || (contentsData && contentsData.error) }),
+      e("div", { className: "memory-ui-path" }, visibleContents.db_path || data.db_path),
+      operationData && operationData.operation === "prefetch" ? e(Card, null,
+        e(CardContent, null,
+          e("div", { className: "memory-ui-muted" }, "Injected context preview · ", operationData.context_char_count || 0, " chars"),
+          operationData.context ? e("div", { className: "memory-ui-fact-content memory-ui-path" }, operationData.context) : e(EmptyState, null, "No context returned.")
+        )
+      ) : null,
+      operationData && operationData.operation === "recall" ? e("div", { className: "memory-ui-fact-list" },
+        operationData.result_source ? e("div", { className: "memory-ui-muted" }, "Result source: ", operationData.result_source) : null,
+        results.length
+          ? results.map(function (result, index) { return e(MnemosyneResultRow, { key: "mnemosyne-result-" + index, result: result }); })
+          : e(EmptyState, null, operationData.error ? "Mnemosyne recall is unavailable." : "No memories returned for this query.")
+      ) : null,
+      e("div", { className: "memory-ui-fact-list" },
+        e("div", { className: "memory-ui-contents-toolbar" },
+          e("div", { className: "memory-ui-muted" }, "Contents · memories: ", visibleContents.memory_count || 0, " / ", visibleContents.total_memories || 0, " · facts: ", visibleContents.fact_count || 0, " / ", visibleContents.total_facts || 0),
+          e(Button, { onClick: refreshContents, className: "memory-ui-refresh", disabled: contentsLoading }, contentsLoading ? "Refreshing..." : "Refresh contents")
+        ),
+        contentsLoading && !contentsData ? e(EmptyState, null, "Loading Mnemosyne contents...") : null,
+        !contentsLoading && contentItems.length
+          ? contentItems.map(function (result, index) { return e(MnemosyneResultRow, { key: "mnemosyne-content-" + index, result: result }); })
+          : null,
+        !contentsLoading && !contentItems.length ? e(EmptyState, null, data.db_exists ? "No Mnemosyne contents returned." : "Mnemosyne database does not exist yet.") : null
+      )
+    );
+  }
+
   function MemoryPage() {
     const [snapshot, setSnapshot] = useState(null);
     const [loading, setLoading] = useState(false);
@@ -625,12 +780,14 @@
     const holographic = snapshot && snapshot.holographic;
     const mem0 = snapshot && snapshot.mem0;
     const honcho = snapshot && snapshot.honcho;
+    const mnemosyne = snapshot && snapshot.mnemosyne;
     const hindsight = snapshot && snapshot.hindsight;
     const showHolographic = !!(holographic && holographic.provider_configured);
     const showMem0 = !!(mem0 && mem0.provider_configured);
     const showHoncho = !!(honcho && honcho.provider_configured);
+    const showMnemosyne = !!(mnemosyne && mnemosyne.provider_configured);
     const showHindsight = !!(hindsight && hindsight.provider_configured);
-    const heroGridClass = showHolographic || showMem0 || showHoncho || showHindsight ? "memory-ui-grid-4" : "memory-ui-grid-2";
+    const heroGridClass = showHolographic || showMem0 || showHoncho || showMnemosyne || showHindsight ? "memory-ui-grid-4" : "memory-ui-grid-2";
 
     return e("div", { className: "memory-ui-page" },
       e(Card, { className: "memory-ui-hero" },
@@ -652,6 +809,7 @@
             showHolographic ? e(StatCard, { label: "Facts", value: holographic ? holographic.total_facts : 0, hint: "holographic facts" }) : null,
             showMem0 ? e(StatCard, { label: "Mem0", value: mem0 ? mem0.total_memories : 0, hint: "Mem0 memories" }) : null,
             showHoncho ? e(StatCard, { label: "Honcho", value: honcho ? ((honcho.user.card || []).length + (honcho.ai.card || []).length) : 0, hint: "peer card facts" }) : null,
+            showMnemosyne ? e(StatCard, { label: "Mnemosyne", value: mnemosyne ? (mnemosyne.total_memories || 0) : 0, hint: "local episodes" }) : null,
             showHindsight ? e(StatCard, { label: "Hindsight", value: hindsight ? (hindsight.bank_id || "active") : "—", hint: "query-only memory" }) : null,
             e(StatCard, { label: "Hermes home", value: builtin ? "active" : "—", hint: builtin ? builtin.hermes_home : "loading" }),
             e(StatCard, { label: "Generated", value: snapshot.generated_at ? fmtTime(snapshot.generated_at) : "—", hint: "snapshot time" })
@@ -671,6 +829,10 @@
         showHoncho ? e(React.Fragment, null,
           e(Separator, null),
           e(HonchoSection, { honcho: honcho, filters: filters, setFilters: setFilters, refresh: refresh, loading: loading })
+        ) : null,
+        showMnemosyne ? e(React.Fragment, null,
+          e(Separator, null),
+          e(MnemosyneSection, { mnemosyne: mnemosyne })
         ) : null,
         showHindsight ? e(React.Fragment, null,
           e(Separator, null),
