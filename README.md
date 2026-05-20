@@ -17,6 +17,9 @@ Current scope:
   * Honcho memory:
     + read-only Honcho workspace, host, peer, and provider configuration state
     + user/AI peer cards, representations, conclusions, and context search
+  * Mnemosyne memory:
+    + read-only local SQLite store inspection for episodes, facts, instructions, gists, and graph rows
+    + explicit recall and injected-context preview through the Hermes Mnemosyne provider
   * Hindsight memory:
     + read-only/query-only Hindsight provider configuration state
     + explicit recall and reflect actions; no automatic retain/write flow
@@ -106,6 +109,7 @@ Top summary:
 - holographic total fact count only when `memory.provider` is currently `holographic`
 - Mem0 memory count only when `memory.provider` is currently `mem0`
 - Honcho peer-card fact count only when `memory.provider` is currently `honcho`
+- Mnemosyne episode count only when `memory.provider` is currently `mnemosyne`
 - Hindsight bank/status only when `memory.provider` is currently `hindsight`
 
 Built-in memory section:
@@ -143,6 +147,16 @@ Honcho memory section, displayed when `memory.provider` is currently `honcho`:
 - user and AI representations
 - conclusions returned for user and AI peers
 - context search after clicking `Apply / refresh` button
+
+Mnemosyne memory section, displayed when `memory.provider` is currently `mnemosyne`:
+
+- whether Mnemosyne is the active provider
+- local data directory and SQLite DB path
+- table counts for episodic memory, Memoria facts/instructions/preferences/timelines, gists, triples, and vector row indexes
+- memory and fact cards from the local SQLite store, with search and limit filters
+- explicit `Recall` query button for ranked memory retrieval through Hermes' Mnemosyne provider
+- explicit `Preview inject` button for the exact prefetch/auto-inject context returned by the provider
+- no remember/sleep/update/forget/import/export endpoint
 
 Hindsight memory section, displayed when `memory.provider` is currently `hindsight`:
 
@@ -231,6 +245,25 @@ The plugin performs read-only calls such as:
 
 It does not call Honcho dialectic reasoning (`peer.chat()` / `honcho_reasoning`) automatically from page load or `/snapshot`.
 
+## Mnemosyne configuration
+
+Mnemosyne support follows Hermes' Mnemosyne memory provider convention. The plugin reads non-secret state from:
+
+- `memory.provider: mnemosyne` in `$HERMES_HOME/config.yaml`
+- `$HERMES_HOME/mnemosyne/data/mnemosyne.db` by default
+- optional `memory.mnemosyne.data_dir` / `memory.mnemosyne.db_path`
+- optional environment variables such as `MNEMOSYNE_DATA_DIR`, `MNEMOSYNE_DB_PATH`, `MNEMOSYNE_PREFETCH_CONTENT_CHARS`, and `MNEMOSYNE_AUTO_SLEEP_ENABLED`
+
+The SQLite connection is opened in read-only mode using `mode=ro`. The dashboard reads ordinary text tables such as `episodic_memory`, `memoria_facts`, `memoria_instructions`, `memoria_preferences`, `memoria_timelines`, `gists`, and `triples`. It deliberately does not query sqlite-vec virtual tables directly; it only counts their rowid side tables when present so the UI works without loading sqlite-vec into the dashboard process.
+
+The plugin performs query-only provider calls:
+
+- `MnemosyneMemoryProvider.initialize(...)`
+- `provider.handle_tool_call("mnemosyne_recall", ...)` for explicit recall
+- `provider.prefetch(...)` for injected-context preview
+
+It does not expose `mnemosyne_remember`, `mnemosyne_sleep`, `mnemosyne_update`, `mnemosyne_forget`, `mnemosyne_import`, or any other write/maintenance tool.
+
 ## Hindsight configuration
 
 Hindsight support follows Hermes' bundled `hindsight` memory provider convention. The plugin reads non-secret configuration from:
@@ -266,7 +299,7 @@ Available API endpoints:
 
 ### GET `/status`
 
-Returns plugin status, active Hermes home, configured memory provider, built-in memory paths, holographic DB path, Mem0 configuration status, Honcho configuration status, and Hindsight configuration status.
+Returns plugin status, active Hermes home, configured memory provider, built-in memory paths, holographic DB path, Mem0 configuration status, Honcho configuration status, Mnemosyne configuration status, and Hindsight configuration status.
 
 Example:
 
@@ -332,6 +365,49 @@ Example:
 curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/honcho?limit=25&search=dashboard' | jq
 ```
 
+### GET `/mnemosyne`
+
+Returns Mnemosyne provider status plus read-only local store contents.
+
+### GET `/mnemosyne/contents`
+
+Lists Mnemosyne local SQLite memory and fact rows. This is read-only.
+
+Query parameters:
+
+- `search`: optional text filter applied to visible memory/fact text and metadata columns
+- `limit`: optional, defaults to 25, capped at 100
+
+```bash
+curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/mnemosyne/contents?search=dashboard&limit=25' | jq
+```
+
+### GET `/mnemosyne/recall`
+
+Runs explicit Mnemosyne recall through the Hermes provider.
+
+Query parameters:
+
+- `query`: required query string
+- `limit`: 1-100, default 25
+- `temporal_weight`: 0.0-1.0, default 0.2
+
+```bash
+curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/mnemosyne/recall?query=dashboard&limit=25&temporal_weight=0.2' | jq
+```
+
+### GET `/mnemosyne/prefetch`
+
+Returns the injected-context preview generated by Mnemosyne prefetch.
+
+Query parameters:
+
+- `query`: required query string
+
+```bash
+curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/mnemosyne/prefetch?query=dashboard' | jq
+```
+
 ### GET `/hindsight`
 
 Returns Hindsight provider status/config only. It does not run recall or reflect.
@@ -380,7 +456,7 @@ curl 'http://127.0.0.1:9119/api/plugins/hermes-memory-ui/hindsight/reflect?query
 
 ### GET `/snapshot`
 
-Combined payload used by the UI. Accepts the same query parameters as `/holographic`; `limit` and `search` are also applied to Mem0 and Honcho, with Honcho internally capped at 100. Hindsight in `/snapshot` is status/config only and does not query recall/reflect.
+Combined payload used by the UI. Accepts the same query parameters as `/holographic`; `limit` and `search` are also applied to Mem0, Honcho, and Mnemosyne, with Honcho and Mnemosyne internally capped at 100. Hindsight in `/snapshot` is status/config only and does not query recall/reflect.
 
 ```bash
 curl http://127.0.0.1:9119/api/plugins/hermes-memory-ui/snapshot | jq
@@ -402,6 +478,7 @@ Memory writes are semantically loaded:
 
 - Built-in memory has limits, delimiter parsing, locking, duplicate handling, and prompt-injection scanning.
 - Holographic facts maintain FTS indexes, entity links, HRR vectors, trust scores, and memory banks.
+- Mnemosyne maintains embeddings, Memoria-derived structured tables, graph rows, sleep/consolidation flows, and provider-level recall semantics.
 - Built-in `memory(add)` may mirror into holographic memory, but `replace`, `remove`, and direct file edits do not reliably mirror.
 
 A dashboard that writes directly to files or SQLite can silently corrupt memory semantics.

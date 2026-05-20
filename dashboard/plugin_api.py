@@ -11,6 +11,7 @@ and provider-specific semantics are preserved.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import sqlite3
@@ -33,6 +34,7 @@ except Exception:  # Allows local syntax/import tests outside the dashboard.
 
 router = APIRouter()
 
+PLUGIN_VERSION = "0.4.7"
 ENTRY_DELIMITER = "\n§\n"
 DEFAULT_MEMORY_LIMIT = 2200
 DEFAULT_USER_LIMIT = 1375
@@ -44,6 +46,8 @@ DEFAULT_HONCHO_LIMIT = 50
 MAX_HONCHO_LIMIT = 100
 DEFAULT_HINDSIGHT_LIMIT = 25
 MAX_HINDSIGHT_LIMIT = 100
+DEFAULT_MNEMOSYNE_LIMIT = 25
+MAX_MNEMOSYNE_LIMIT = 100
 HINDSIGHT_DEFAULT_CLOUD_URL = "https://api.hindsight.vectorize.io"
 HINDSIGHT_DEFAULT_LOCAL_URL = "http://localhost:8888"
 VALID_HINDSIGHT_BUDGETS = {"low", "mid", "high"}
@@ -596,7 +600,7 @@ def _honcho_config_payload(config: Optional[Dict[str, Any]] = None) -> Dict[str,
             "_client_config": cfg,
         })
     except Exception as exc:
-        base["_import_error"] = str(exc)
+        base["_import_error"] = f"Honcho provider helpers unavailable: {exc}"
     return base
 
 
@@ -760,6 +764,496 @@ def _honcho_payload(
     return base
 
 
+def _resolve_mnemosyne_data_dir(config: Dict[str, Any]) -> Path:
+    memory_cfg = config.get("memory", {}) if isinstance(config.get("memory"), dict) else {}
+    mnemosyne_cfg = memory_cfg.get("mnemosyne", {}) if isinstance(memory_cfg.get("mnemosyne"), dict) else {}
+    configured = (
+        mnemosyne_cfg.get("data_dir")
+        or mnemosyne_cfg.get("path")
+        or _env_value("MNEMOSYNE_DATA_DIR", "")
+        or str(_hermes_home() / "mnemosyne" / "data")
+    )
+    return _expand_path(str(configured), _hermes_home()) or (_hermes_home() / "mnemosyne" / "data")
+
+
+def _resolve_mnemosyne_db_path(config: Dict[str, Any]) -> Path:
+    memory_cfg = config.get("memory", {}) if isinstance(config.get("memory"), dict) else {}
+    mnemosyne_cfg = memory_cfg.get("mnemosyne", {}) if isinstance(memory_cfg.get("mnemosyne"), dict) else {}
+    configured = mnemosyne_cfg.get("db_path") or _env_value("MNEMOSYNE_DB_PATH", "")
+    if configured:
+        path = _expand_path(str(configured), _hermes_home())
+        if path:
+            return path
+    return _resolve_mnemosyne_data_dir(config) / "mnemosyne.db"
+
+
+def _load_mnemosyne_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
+    data_dir = _resolve_mnemosyne_data_dir(config)
+    db_path = _resolve_mnemosyne_db_path(config)
+    prefetch_chars = _env_value("MNEMOSYNE_PREFETCH_CONTENT_CHARS", "")
+    return {
+        "provider_configured": _dig(config, "memory", "provider", default=None) == "mnemosyne",
+        "config_path": str(_hermes_home() / "config.yaml"),
+        "data_dir": str(data_dir),
+        "db_path": str(db_path),
+        "db_exists": db_path.exists(),
+        "prefetch_content_chars": prefetch_chars,
+        "auto_sleep_enabled": _truthy(_env_value("MNEMOSYNE_AUTO_SLEEP_ENABLED", "true"), True),
+    }
+
+
+def _mnemosyne_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ? LIMIT 1",
+            (table,),
+        ).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _mnemosyne_table_count(conn: sqlite3.Connection, table: str) -> int:
+    if not _mnemosyne_table_exists(conn, table):
+        return 0
+    try:
+        quoted = table.replace('"', '""')
+        return int(conn.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()[0])
+    except Exception:
+        return 0
+
+
+def _mnemosyne_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    try:
+        quoted = table.replace('"', '""')
+        return [str(row["name"]) for row in conn.execute(f'PRAGMA table_info("{quoted}")').fetchall()]
+    except Exception:
+        return []
+
+
+def _json_object(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mnemosyne_order_clause(columns: List[str], preferred: List[str]) -> str:
+    for column in preferred:
+        if column in columns:
+            quoted = column.replace('"', '""')
+            return f'ORDER BY "{quoted}" DESC'
+    return ""
+
+
+def _mnemosyne_where(search: Optional[str], columns: List[str], candidates: List[str]) -> tuple[str, List[Any]]:
+    if not search:
+        return "", []
+    available = [column for column in candidates if column in columns]
+    if not available:
+        return "", []
+    where = "WHERE " + " OR ".join([f'"{column.replace(chr(34), chr(34) + chr(34))}" LIKE ?' for column in available])
+    return where, [_safe_like(search)] * len(available)
+
+
+def _normalize_mnemosyne_memory(row: Dict[str, Any], index: int) -> Dict[str, Any]:
+    metadata = _json_object(row.get("metadata_json"))
+    text = row.get("content") or row.get("text") or row.get("memory") or ""
+    return {
+        "id": row.get("id") or row.get("rowid") or str(index + 1),
+        "text": str(text),
+        "score": row.get("score"),
+        "type": row.get("memory_type") or row.get("source") or "memory",
+        "source": row.get("source") or "",
+        "timestamp": row.get("timestamp"),
+        "created_at": row.get("created_at"),
+        "session_id": row.get("session_id"),
+        "importance": row.get("importance"),
+        "tier": row.get("tier"),
+        "recall_count": row.get("recall_count"),
+        "last_recalled": row.get("last_recalled"),
+        "scope": row.get("scope"),
+        "channel_id": row.get("channel_id"),
+        "trust_tier": row.get("trust_tier"),
+        "metadata": _json_safe(metadata),
+    }
+
+
+def _mnemosyne_fact_text(table: str, row: Dict[str, Any]) -> str:
+    if table == "memoria_facts":
+        key = str(row.get("key") or "").strip()
+        value = str(row.get("value") or "").strip()
+        if key and value:
+            return f"{key}: {value}"
+        return value or key or str(row.get("context_snippet") or "")
+    if table == "memoria_instructions":
+        return str(row.get("instruction") or "")
+    if table == "memoria_preferences":
+        return str(row.get("preference") or "")
+    if table == "memoria_timelines":
+        return str(row.get("description") or "")
+    if table == "memoria_kg":
+        return " ".join(str(row.get(key) or "") for key in ("subject", "predicate", "object")).strip()
+    if table == "triples":
+        return " ".join(str(row.get(key) or "") for key in ("subject", "predicate", "object")).strip()
+    if table == "gists":
+        return str(row.get("text") or "")
+    if table == "consolidated_facts":
+        return " ".join(str(row.get(key) or "") for key in ("subject", "predicate", "object")).strip()
+    if table == "facts":
+        return " ".join(str(row.get(key) or "") for key in ("subject", "predicate", "object")).strip()
+    return str(row.get("content") or row.get("value") or row.get("text") or "")
+
+
+def _normalize_mnemosyne_fact(table: str, row: Dict[str, Any], index: int) -> Dict[str, Any]:
+    row_id = row.get("id") or row.get("fact_id") or row.get("event_id") or str(index + 1)
+    timestamp = row.get("timestamp") or row.get("date") or row.get("created_at")
+    metadata = {
+        key: value
+        for key, value in row.items()
+        if key not in {"id", "fact_id", "event_id", "content", "text", "value"}
+    }
+    return {
+        "id": row_id,
+        "text": _mnemosyne_fact_text(table, row),
+        "score": row.get("importance") or row.get("confidence"),
+        "type": table,
+        "source": row.get("source") or row.get("session_id") or "",
+        "timestamp": timestamp,
+        "created_at": row.get("created_at"),
+        "metadata": _json_safe(metadata),
+    }
+
+
+def _mnemosyne_fetch_memories(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    search: Optional[str],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for table in ("episodic_memory", "working_memory", "memories"):
+        if len(rows) >= limit or not _mnemosyne_table_exists(conn, table):
+            continue
+        columns = _mnemosyne_columns(conn, table)
+        selected = [
+            column
+            for column in (
+                "rowid",
+                "id",
+                "content",
+                "source",
+                "timestamp",
+                "session_id",
+                "importance",
+                "metadata_json",
+                "created_at",
+                "tier",
+                "memory_type",
+                "recall_count",
+                "last_recalled",
+                "scope",
+                "channel_id",
+                "trust_tier",
+            )
+            if column in columns
+        ]
+        if not selected:
+            continue
+        where, params = _mnemosyne_where(search, columns, ["content", "source", "session_id", "metadata_json"])
+        order = _mnemosyne_order_clause(columns, ["timestamp", "created_at", "rowid", "id"])
+        quoted_table = table.replace('"', '""')
+        quoted_columns = ", ".join(f'"{column.replace(chr(34), chr(34) + chr(34))}"' for column in selected)
+        sql = f'SELECT {quoted_columns} FROM "{quoted_table}" {where} {order} LIMIT ?'
+        try:
+            fetched = [dict(row) for row in conn.execute(sql, params + [limit - len(rows)]).fetchall()]
+        except Exception:
+            fetched = []
+        rows.extend(fetched)
+    return [_normalize_mnemosyne_memory(row, index) for index, row in enumerate(rows[:limit])]
+
+
+def _mnemosyne_fetch_facts(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    search: Optional[str],
+) -> List[Dict[str, Any]]:
+    specs = [
+        ("memoria_facts", ["id", "session_id", "fact_type", "key", "value", "context_snippet", "importance", "timestamp"], ["key", "value", "context_snippet"]),
+        ("memoria_instructions", ["id", "session_id", "instruction", "active", "topic", "context_snippet"], ["instruction", "topic", "context_snippet"]),
+        ("memoria_preferences", ["id", "session_id", "preference", "topic", "evolution", "context_snippet"], ["preference", "topic", "context_snippet"]),
+        ("memoria_timelines", ["event_id", "session_id", "date", "description", "source"], ["description", "source", "date"]),
+        ("memoria_kg", ["id", "session_id", "subject", "predicate", "object", "confidence"], ["subject", "predicate", "object"]),
+        ("triples", ["id", "subject", "predicate", "object", "valid_from", "source", "confidence", "created_at"], ["subject", "predicate", "object", "source"]),
+        ("gists", ["id", "text", "timestamp", "participants_json", "location", "emotion", "time_scope", "memory_id", "created_at"], ["text", "participants_json", "location", "emotion"]),
+        ("consolidated_facts", ["id", "subject", "predicate", "object", "confidence", "mention_count", "first_seen", "last_seen", "veracity"], ["subject", "predicate", "object"]),
+        ("facts", ["fact_id", "session_id", "subject", "predicate", "object", "timestamp", "confidence", "created_at"], ["subject", "predicate", "object"]),
+    ]
+    rows: List[tuple[str, Dict[str, Any]]] = []
+    for table, desired, search_columns in specs:
+        if len(rows) >= limit or not _mnemosyne_table_exists(conn, table):
+            continue
+        columns = _mnemosyne_columns(conn, table)
+        selected = [column for column in desired if column in columns]
+        if not selected:
+            continue
+        where, params = _mnemosyne_where(search, columns, search_columns)
+        order = _mnemosyne_order_clause(columns, ["timestamp", "date", "created_at", "id", "event_id", "fact_id"])
+        quoted_table = table.replace('"', '""')
+        quoted_columns = ", ".join(f'"{column.replace(chr(34), chr(34) + chr(34))}"' for column in selected)
+        sql = f'SELECT {quoted_columns} FROM "{quoted_table}" {where} {order} LIMIT ?'
+        try:
+            fetched = [dict(row) for row in conn.execute(sql, params + [limit - len(rows)]).fetchall()]
+        except Exception:
+            fetched = []
+        rows.extend((table, row) for row in fetched)
+    return [_normalize_mnemosyne_fact(table, row, index) for index, (table, row) in enumerate(rows[:limit])]
+
+
+def _mnemosyne_config_payload(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = _load_mnemosyne_config(config)
+    cfg.update({
+        "id": "mnemosyne",
+        "label": "Mnemosyne memory",
+        "mode": "read-only/query-only",
+        "error": None,
+        "generated_at": time.time(),
+    })
+    return cfg
+
+
+def _mnemosyne_contents_payload(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = DEFAULT_MNEMOSYNE_LIMIT,
+    search: Optional[str] = None,
+) -> Dict[str, Any]:
+    config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
+    try:
+        limit = int(limit or DEFAULT_MNEMOSYNE_LIMIT)
+    except Exception:
+        limit = DEFAULT_MNEMOSYNE_LIMIT
+    limit = max(1, min(limit, MAX_MNEMOSYNE_LIMIT))
+    search = search if isinstance(search, str) and search.strip() else None
+    base = _mnemosyne_config_payload(config)
+    base.update({
+        "operation": "contents",
+        "limit": limit,
+        "search": search or "",
+        "table_counts": {},
+        "memories": [],
+        "memory_count": 0,
+        "total_memories": 0,
+        "facts": [],
+        "fact_count": 0,
+        "total_facts": 0,
+        "vector_rows": 0,
+    })
+    db_path = Path(str(base["db_path"]))
+    if not db_path.exists():
+        return base
+    try:
+        with _connect_readonly(db_path) as conn:
+            count_tables = [
+                "episodic_memory",
+                "working_memory",
+                "memories",
+                "memoria_facts",
+                "memoria_instructions",
+                "memoria_preferences",
+                "memoria_timelines",
+                "memoria_kg",
+                "gists",
+                "triples",
+                "consolidated_facts",
+                "facts",
+                "scratchpad",
+                "vec_episodes_rowids",
+                "vec_facts_rowids",
+            ]
+            counts = {table: _mnemosyne_table_count(conn, table) for table in count_tables}
+            base["table_counts"] = counts
+            base["total_memories"] = counts.get("episodic_memory", 0) + counts.get("working_memory", 0) + counts.get("memories", 0)
+            base["total_facts"] = (
+                counts.get("memoria_facts", 0)
+                + counts.get("memoria_instructions", 0)
+                + counts.get("memoria_preferences", 0)
+                + counts.get("memoria_timelines", 0)
+                + counts.get("memoria_kg", 0)
+                + counts.get("gists", 0)
+                + counts.get("triples", 0)
+                + counts.get("consolidated_facts", 0)
+                + counts.get("facts", 0)
+            )
+            base["vector_rows"] = counts.get("vec_episodes_rowids", 0) + counts.get("vec_facts_rowids", 0)
+            base["memories"] = _mnemosyne_fetch_memories(conn, limit=limit, search=search)
+            base["memory_count"] = len(base["memories"])
+            base["facts"] = _mnemosyne_fetch_facts(conn, limit=limit, search=search)
+            base["fact_count"] = len(base["facts"])
+    except Exception as exc:
+        base["error"] = str(exc)
+    return base
+
+
+def _load_mnemosyne_provider_class() -> Any:
+    errors: List[str] = []
+    try:
+        from plugins.memory.mnemosyne import MnemosyneMemoryProvider  # type: ignore
+
+        return MnemosyneMemoryProvider
+    except Exception as exc:
+        errors.append(f"plugins.memory.mnemosyne: {exc}")
+
+    plugin_file = _hermes_home() / "plugins" / "mnemosyne" / "__init__.py"
+    if plugin_file.exists():
+        try:
+            spec = importlib.util.spec_from_file_location("hermes_memory_ui_mnemosyne_plugin", plugin_file)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                provider_cls = getattr(module, "MnemosyneMemoryProvider", None)
+                if provider_cls is not None:
+                    return provider_cls
+        except Exception as exc:
+            errors.append(f"{plugin_file}: {exc}")
+
+    try:
+        from hermes_memory_provider import MnemosyneMemoryProvider  # type: ignore
+
+        return MnemosyneMemoryProvider
+    except Exception as exc:
+        errors.append(f"hermes_memory_provider: {exc}")
+
+    raise RuntimeError("Mnemosyne provider is not available in the dashboard environment: " + "; ".join(errors))
+
+
+def _make_mnemosyne_provider() -> Any:
+    provider_cls = _load_mnemosyne_provider_class()
+    provider = provider_cls()
+    provider.initialize(session_id="dashboard", hermes_home=str(_hermes_home()), platform="dashboard")
+    return provider
+
+
+def _decode_mnemosyne_response(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, list):
+                return {"results": parsed}
+        except Exception:
+            return {"context": value}
+    return {"result": _json_safe(value)}
+
+
+def _normalize_mnemosyne_result(item: Any, index: int) -> Dict[str, Any]:
+    data = _object_to_dict(item)
+    if not data and isinstance(item, str):
+        data = {"content": item}
+    text = data.get("content") or data.get("text") or data.get("memory") or data.get("summary") or ""
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else data.get("metadata_json")
+    return {
+        "id": data.get("id") or data.get("memory_id") or data.get("uuid") or str(index + 1),
+        "text": str(text),
+        "score": data.get("score") or data.get("similarity") or data.get("importance"),
+        "type": data.get("memory_type") or data.get("type") or data.get("source") or "memory",
+        "source": data.get("source") or "",
+        "timestamp": data.get("timestamp") or data.get("created_at"),
+        "metadata": _json_safe(_json_object(metadata) if isinstance(metadata, str) else (metadata if isinstance(metadata, dict) else {})),
+    }
+
+
+def _mnemosyne_payload(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    query: Optional[str] = None,
+    limit: int = DEFAULT_MNEMOSYNE_LIMIT,
+    temporal_weight: float = 0.2,
+    mode: str = "status",
+) -> Dict[str, Any]:
+    config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
+    query = query if isinstance(query, str) and query.strip() else None
+    try:
+        limit = int(limit or DEFAULT_MNEMOSYNE_LIMIT)
+    except Exception:
+        limit = DEFAULT_MNEMOSYNE_LIMIT
+    limit = max(1, min(limit, MAX_MNEMOSYNE_LIMIT))
+    try:
+        temporal_weight = float(temporal_weight)
+    except Exception:
+        temporal_weight = 0.2
+    temporal_weight = max(0.0, min(1.0, temporal_weight))
+    base = _mnemosyne_config_payload(config)
+    base.update({
+        "operation": mode,
+        "query": query or "",
+        "limit": limit,
+        "temporal_weight": temporal_weight,
+        "results": [],
+        "result_count": 0,
+        "context": "",
+        "context_char_count": 0,
+        "result_source": "",
+    })
+    if mode == "status":
+        return base
+    if mode not in {"recall", "prefetch"}:
+        base["error"] = f"Unsupported Mnemosyne operation: {mode}"
+        return base
+    if not query:
+        base["error"] = "Query is required for Mnemosyne recall/prefetch."
+        return base
+    provider = None
+    try:
+        provider = _make_mnemosyne_provider()
+        if mode == "prefetch":
+            try:
+                context = provider.prefetch(query, session_id="dashboard")
+            except TypeError:
+                context = provider.prefetch(query)
+            base["context"] = str(context or "")
+            base["context_char_count"] = len(base["context"])
+            base["result_source"] = "mnemosyne_prefetch"
+            return base
+        response = provider.handle_tool_call(
+            "mnemosyne_recall",
+            {"query": query, "limit": limit, "temporal_weight": temporal_weight},
+        )
+        decoded = _decode_mnemosyne_response(response)
+        if decoded.get("error"):
+            base["error"] = str(decoded.get("error"))
+        raw_results = decoded.get("results") or decoded.get("memories") or decoded.get("matches") or []
+        if isinstance(raw_results, dict):
+            raw_results = list(raw_results.values())
+        if not isinstance(raw_results, list):
+            raw_results = []
+        base["results"] = [_normalize_mnemosyne_result(item, index) for index, item in enumerate(raw_results[:limit])]
+        base["result_count"] = len(base["results"])
+        base["result_source"] = "mnemosyne_recall"
+    except Exception as exc:
+        base["error"] = str(exc)
+    finally:
+        shutdown = getattr(provider, "shutdown", None) if provider is not None else None
+        if callable(shutdown):
+            try:
+                import contextlib
+                import io
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    shutdown()
+            except Exception:
+                pass
+    return base
+
+
 def _load_hindsight_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Load non-secret Hindsight configuration for dashboard inspection."""
     config = config if config is not None else _read_yaml(_hermes_home() / "config.yaml")
@@ -916,7 +1410,7 @@ def _hindsight_client_call(cfg: Dict[str, Any], fn: Callable[[Any], Any]) -> Any
             base_url=str(cfg.get("api_url") or HINDSIGHT_DEFAULT_LOCAL_URL).rstrip("/"),
             api_key=cfg.get("_api_key") or None,
             timeout=_hindsight_timeout_seconds(cfg),
-            user_agent="hermes-memory-ui-dashboard/0.4.6",
+            user_agent=f"hermes-memory-ui-dashboard/{PLUGIN_VERSION}",
         )
         try:
             return await fn(client)
@@ -1156,10 +1650,11 @@ async def status() -> Dict[str, Any]:
     db_path = _resolve_holographic_db(config)
     mem0_cfg = _load_mem0_config(config)
     honcho_cfg = _honcho_config_payload(config)
+    mnemosyne_cfg = _load_mnemosyne_config(config)
     hindsight_cfg = _load_hindsight_config(config)
     return {
         "plugin": "hermes-memory-ui",
-        "version": "0.4.6",
+        "version": PLUGIN_VERSION,
         "mode": "read-only",
         "hermes_home": str(home),
         "config_path": str(home / "config.yaml"),
@@ -1196,6 +1691,15 @@ async def status() -> Dict[str, Any]:
             "recall_mode": honcho_cfg["recall_mode"],
             "session_strategy": honcho_cfg["session_strategy"],
             "provider_configured": _dig(config, "memory", "provider", default=None) == "honcho",
+        },
+        "mnemosyne": {
+            "config_path": mnemosyne_cfg["config_path"],
+            "data_dir": mnemosyne_cfg["data_dir"],
+            "db_path": mnemosyne_cfg["db_path"],
+            "db_exists": mnemosyne_cfg["db_exists"],
+            "prefetch_content_chars": mnemosyne_cfg["prefetch_content_chars"],
+            "auto_sleep_enabled": mnemosyne_cfg["auto_sleep_enabled"],
+            "provider_configured": mnemosyne_cfg["provider_configured"],
         },
         "hindsight": {
             "config_path": hindsight_cfg["config_path"],
@@ -1277,6 +1781,35 @@ async def hindsight_reflect(
     return _hindsight_payload(query=query, limit=1, mode="reflect")
 
 
+@router.get("/mnemosyne")
+async def mnemosyne() -> Dict[str, Any]:
+    return _mnemosyne_contents_payload()
+
+
+@router.get("/mnemosyne/contents")
+async def mnemosyne_contents(
+    limit: int = Query(DEFAULT_MNEMOSYNE_LIMIT, ge=1, le=MAX_MNEMOSYNE_LIMIT),
+    search: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    return _mnemosyne_contents_payload(limit=limit, search=search or None)
+
+
+@router.get("/mnemosyne/recall")
+async def mnemosyne_recall(
+    query: str = Query(...),
+    limit: int = Query(DEFAULT_MNEMOSYNE_LIMIT, ge=1, le=MAX_MNEMOSYNE_LIMIT),
+    temporal_weight: float = Query(0.2, ge=0.0, le=1.0),
+) -> Dict[str, Any]:
+    return _mnemosyne_payload(query=query, limit=limit, temporal_weight=temporal_weight, mode="recall")
+
+
+@router.get("/mnemosyne/prefetch")
+async def mnemosyne_prefetch(
+    query: str = Query(...),
+) -> Dict[str, Any]:
+    return _mnemosyne_payload(query=query, mode="prefetch")
+
+
 @router.get("/snapshot")
 async def snapshot(
     limit: int = Query(DEFAULT_FACT_LIMIT, ge=1, le=MAX_FACT_LIMIT),
@@ -1287,7 +1820,7 @@ async def snapshot(
     config = _read_yaml(_hermes_home() / "config.yaml")
     return {
         "plugin": "hermes-memory-ui",
-        "version": "0.4.6",
+        "version": PLUGIN_VERSION,
         "mode": "read-only",
         "builtin": _builtin_payload(config),
         "holographic": _holographic_payload(
@@ -1299,6 +1832,7 @@ async def snapshot(
         ),
         "mem0": _mem0_payload(config, limit=limit, search=search or None),
         "honcho": _honcho_payload(config, limit=limit, search=search or None),
+        "mnemosyne": _mnemosyne_contents_payload(config, limit=limit, search=search or None),
         "hindsight": _hindsight_payload(config, mode="status"),
         "generated_at": time.time(),
     }

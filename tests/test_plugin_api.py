@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -10,6 +11,9 @@ PLUGIN_API = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
 
 def load_plugin_api(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    fake_constants = types.ModuleType("hermes_constants")
+    fake_constants.get_hermes_home = lambda: str(tmp_path)
+    monkeypatch.setitem(sys.modules, "hermes_constants", fake_constants)
     spec = importlib.util.spec_from_file_location("plugin_api_under_test", PLUGIN_API)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -424,3 +428,154 @@ def test_hindsight_recall_does_not_fall_back_to_documents(monkeypatch, tmp_path)
     assert payload["result_count"] == 0
     assert payload["results"] == []
     assert "secret" not in json.dumps(payload)
+
+
+def create_mnemosyne_db(tmp_path):
+    db_dir = tmp_path / "mnemosyne" / "data"
+    db_dir.mkdir(parents=True)
+    db_path = db_dir / "mnemosyne.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE episodic_memory (
+            rowid INTEGER,
+            id TEXT,
+            content TEXT,
+            source TEXT,
+            timestamp TEXT,
+            session_id TEXT,
+            importance REAL,
+            metadata_json TEXT,
+            created_at TEXT,
+            tier INTEGER,
+            memory_type TEXT,
+            recall_count INTEGER,
+            trust_tier TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO episodic_memory
+        VALUES (1, 'm1', 'Mnemosyne dashboard memory about recall quality', 'test', '2026-05-20T10:00:00Z',
+                's1', 0.9, '{"topic":"dashboard"}', '2026-05-20T10:00:00Z', 1, 'experience', 2, 'STATED')
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE memoria_facts (
+            id INTEGER,
+            session_id TEXT,
+            fact_type TEXT,
+            key TEXT,
+            value TEXT,
+            context_snippet TEXT,
+            importance REAL,
+            timestamp TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO memoria_facts
+        VALUES (1, 's1', 'preference', 'memory_provider', 'mnemosyne',
+                'dashboard should show Mnemosyne facts', 0.8, '2026-05-20T10:00:01Z')
+        """
+    )
+    conn.execute("CREATE TABLE vec_episodes_rowids (rowid INTEGER, id TEXT, chunk_id INTEGER, chunk_offset INTEGER)")
+    conn.execute("INSERT INTO vec_episodes_rowids VALUES (1, 'm1', 1, 0)")
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def install_fake_mnemosyne_provider(monkeypatch, calls):
+    fake_plugins = types.ModuleType("plugins")
+    fake_memory = types.ModuleType("plugins.memory")
+    fake_mnemosyne = types.ModuleType("plugins.memory.mnemosyne")
+
+    class FakeProvider:
+        def initialize(self, session_id, **kwargs):
+            calls.append(("initialize", session_id, kwargs))
+
+        def handle_tool_call(self, tool_name, args, **kwargs):
+            calls.append(("handle_tool_call", tool_name, args, kwargs))
+            return json.dumps({
+                "query": args["query"],
+                "count": 1,
+                "results": [{
+                    "id": "r1",
+                    "content": "Mnemosyne recall result",
+                    "score": 0.93,
+                    "source": "episodic_memory",
+                    "metadata": {"scope": "dashboard"},
+                }],
+            })
+
+        def prefetch(self, query, session_id=""):
+            calls.append(("prefetch", query, session_id))
+            return "Injected Mnemosyne context for " + query
+
+        def shutdown(self):
+            calls.append(("shutdown",))
+
+    fake_mnemosyne.MnemosyneMemoryProvider = FakeProvider
+    monkeypatch.setitem(sys.modules, "plugins", fake_plugins)
+    monkeypatch.setitem(sys.modules, "plugins.memory", fake_memory)
+    monkeypatch.setitem(sys.modules, "plugins.memory.mnemosyne", fake_mnemosyne)
+
+
+def test_mnemosyne_contents_reads_local_db_without_writes(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: mnemosyne\n", encoding="utf-8")
+    db_path = create_mnemosyne_db(tmp_path)
+
+    module = load_plugin_api(monkeypatch, tmp_path)
+    payload = module._mnemosyne_contents_payload(limit=5, search="dashboard")
+
+    assert payload["provider_configured"] is True
+    assert payload["db_path"] == str(db_path)
+    assert payload["db_exists"] is True
+    assert payload["table_counts"]["episodic_memory"] == 1
+    assert payload["total_memories"] == 1
+    assert payload["vector_rows"] == 1
+    assert payload["memory_count"] == 1
+    assert payload["memories"][0]["text"] == "Mnemosyne dashboard memory about recall quality"
+    assert payload["fact_count"] == 1
+    assert payload["facts"][0]["type"] == "memoria_facts"
+    assert payload["facts"][0]["text"] == "memory_provider: mnemosyne"
+
+
+def test_mnemosyne_recall_and_prefetch_use_provider_without_remember(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: mnemosyne\n", encoding="utf-8")
+    calls = []
+    install_fake_mnemosyne_provider(monkeypatch, calls)
+
+    module = load_plugin_api(monkeypatch, tmp_path)
+    recall = module._mnemosyne_payload(query="dashboard", limit=2, temporal_weight=0.5, mode="recall")
+    prefetch = module._mnemosyne_payload(query="dashboard", mode="prefetch")
+
+    assert recall["result_source"] == "mnemosyne_recall"
+    assert recall["result_count"] == 1
+    assert recall["results"][0]["text"] == "Mnemosyne recall result"
+    assert recall["results"][0]["score"] == 0.93
+    assert prefetch["result_source"] == "mnemosyne_prefetch"
+    assert prefetch["context"] == "Injected Mnemosyne context for dashboard"
+    assert ("handle_tool_call", "mnemosyne_recall", {"query": "dashboard", "limit": 2, "temporal_weight": 0.5}, {}) in calls
+    assert ("prefetch", "dashboard", "dashboard") in calls
+    assert not any(call and call[0] == "mnemosyne_remember" for call in calls)
+
+
+def test_mnemosyne_snapshot_and_status_include_provider(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("memory:\n  provider: mnemosyne\n", encoding="utf-8")
+    create_mnemosyne_db(tmp_path)
+
+    module = load_plugin_api(monkeypatch, tmp_path)
+    import asyncio
+
+    snapshot = asyncio.run(module.snapshot(limit=5))
+    status = asyncio.run(module.status())
+
+    assert snapshot["mnemosyne"]["provider_configured"] is True
+    assert snapshot["mnemosyne"]["memory_count"] == 1
+    assert status["mnemosyne"]["provider_configured"] is True
+    assert status["mnemosyne"]["db_exists"] is True
